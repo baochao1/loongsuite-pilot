@@ -1,0 +1,30 @@
+{
+  "id": "codebuddy",
+  "displayName": "CodeBuddy",
+  "deployMode": "hook",
+  "detection": {
+    "paths": ["~/.codebuddy"],
+    "commands": []
+  },
+  "hook": {
+    "settingsPath": "~/.codebuddy/settings.json",
+    "events": [
+      "SessionStart",
+      "UserPromptSubmit",
+      "PreToolUse",
+      "PostToolUse",
+      "Stop"
+    ],
+    "hookCommand": "$PILOT_DATA/hooks/codebuddy-loongsuite-pilot-hook.sh",
+    "format": "nested",
+    "eventSubcommand": "kebab-case",
+    "eventMatchers": {
+      "PreToolUse": ".*",
+      "PostToolUse": ".*"
+    }
+  },
+  "input": {
+    "type": "codebuddy-hook",
+    "logDir": "$PILOT_DATA/logs/codebuddy/history"
+  }
+}

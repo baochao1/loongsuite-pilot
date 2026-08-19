@@ -61,6 +61,7 @@ import { DshLogInput, ensureDshLogDir } from '../inputs/dsh-log/dsh-log-input.js
 import { OpenClawPluginInput, ensureOpenClawPluginLogDir } from '../inputs/openclaw-plugin/openclaw-plugin-input.js';
 import { WukongInput } from '../inputs/wukong/wukong-input.js';
 import { WorkBuddyInput } from '../inputs/workbuddy/workbuddy-input.js';
+import { CodeBuddyHookInput } from '../inputs/codebuddy-hook/codebuddy-hook-input.js';
 
 import { LogRetentionService } from './log-retention-service.js';
 import { CorrelationStore } from './upstream-link/correlation-store.js';
@@ -122,6 +123,7 @@ export class Orchestrator extends EventEmitter {
     'qoder-cli-hook': 'qoder',
     'qoder-cli-session': 'qoder',
     'cursor-hook': 'cursor',
+    'codebuddy': 'codebuddy',
     'claude-code-log': 'claude-code',
     'codex-transcript': 'codex',
     'kiro-cli-log': 'kiro-cli',
@@ -1517,6 +1519,26 @@ export class Orchestrator extends EventEmitter {
             listenerCfg.workbuddy?.enabled ?? true,
           ),
         pollIntervalMs: listenerCfg.workbuddy?.pollInterval,
+      }),
+    );
+
+    // --- CodeBuddy (Hook JSONL, fail-open collection only) ---
+    const codeBuddyLogDir = path.join(this.dataDir, 'logs', 'codebuddy', 'history');
+    const codeBuddyInput = new CodeBuddyHookInput({
+      stateStore: this.stateStore,
+      logDir: codeBuddyLogDir,
+    });
+    this.inputManager.registerInput(codeBuddyInput);
+    entries.push(
+      this.inputManager.buildDetectionEntry(codeBuddyInput, {
+        watchPaths: CodeBuddyHookInput.getWatchPaths(),
+        isAvailable: CodeBuddyHookInput.checkAvailability,
+        enabled: () => this.isAgentGatedEnabled(Orchestrator.LISTENER_AGENT_MAP['codebuddy']) &&
+          this.agentControlManager.resolveEnabled(
+            'codebuddy',
+            listenerCfg['codebuddy']?.enabled ?? true,
+          ),
+        pollIntervalMs: listenerCfg['codebuddy']?.pollInterval,
       }),
     );
 
