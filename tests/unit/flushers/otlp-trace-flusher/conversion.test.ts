@@ -504,4 +504,102 @@ describe('OtlpTraceFlusher - conversion', () => {
     // All 4 records kept — pairs are complete.
     expect(sanitized).toHaveLength(4);
   });
+
+  describe('enrichLangfuseTraceFields (Langfuse OTLP field mapping)', () => {
+    function makeSpan(id: string, parentId: string | undefined, kind: string) {
+      return {
+        spanContext: () => ({ spanId: id }),
+        parentSpanId: parentId,
+        attributes: { 'gen_ai.span.kind': kind },
+        resource: { attributes: {} as Record<string, unknown> },
+      };
+    }
+
+    it('maps user.id to Langfuse userId (langfuse.user.id + user.id) on resource and every span', () => {
+      const records = [
+        { 'user.id': 'jinwa', 'gen_ai.agent.type': 'claude-code', 'gen_ai.turn.id': 't7' },
+      ] as unknown as AgentActivityEntry[];
+      const root = makeSpan('root-1', undefined, 'ENTRY');
+      const child = makeSpan('child-1', 'root-1', 'LLM');
+
+      (flusher as any).enrichLangfuseTraceFields(records, [root, child], 'claude-code');
+
+      // resource carries both keys so Langfuse maps trace.user + Users module
+      expect(root.resource.attributes['langfuse.user.id']).toBe('jinwa');
+      expect(root.resource.attributes['user.id']).toBe('jinwa');
+      // every span also carries them (for filtering on any span)
+      expect(child.attributes['langfuse.user.id']).toBe('jinwa');
+      expect(child.attributes['user.id']).toBe('jinwa');
+    });
+
+    it('maps session.id (matching gen_ai.session.id) on resource and every span', () => {
+      const records = [
+        { 'user.id': 'jinwa', 'gen_ai.session.id': 'sess-abc', 'gen_ai.agent.type': 'claude-code', 'gen_ai.turn.id': 't7c' },
+      ] as unknown as AgentActivityEntry[];
+      const root = makeSpan('root-1c', undefined, 'ENTRY');
+      const child = makeSpan('child-1c', 'root-1c', 'LLM');
+
+      (flusher as any).enrichLangfuseTraceFields(records, [root, child], 'claude-code');
+
+      expect(root.resource.attributes['session.id']).toBe('sess-abc');
+      expect(root.attributes['session.id']).toBe('sess-abc');
+      expect(child.attributes['session.id']).toBe('sess-abc');
+      // value matches the gen_ai.* attribute the converter emits
+      expect(root.attributes['session.id']).toBe(records[0]['gen_ai.session.id']);
+    });
+
+    it('falls back to span-level gen_ai.session.id when records carry none', () => {
+      const records = [
+        { 'gen_ai.agent.type': 'claude-code', 'gen_ai.turn.id': 't7d' },
+      ] as unknown as AgentActivityEntry[];
+      const root = makeSpan('root-1d', undefined, 'ENTRY');
+      root.attributes['gen_ai.session.id'] = 'sess-from-span';
+
+      (flusher as any).enrichLangfuseTraceFields(records, [root], 'claude-code');
+
+      expect(root.attributes['session.id']).toBe('sess-from-span');
+      expect(root.resource.attributes['session.id']).toBe('sess-from-span');
+    });
+
+    it('sets langfuse.trace.name on the root span (never "Unnamed trace")', () => {
+      const records = [
+        { 'user.id': 'jinwa', 'gen_ai.session.id': 'sess-abc', 'gen_ai.agent.type': 'claude-code', 'gen_ai.turn.id': 't8' },
+      ] as unknown as AgentActivityEntry[];
+      const root = makeSpan('root-2', undefined, 'ENTRY');
+      const child = makeSpan('child-2', 'root-2', 'LLM');
+
+      (flusher as any).enrichLangfuseTraceFields(records, [child, root], 'claude-code');
+
+      expect(root.attributes['langfuse.trace.name']).toBe('claude-code · sess-abc');
+      expect(child.attributes).not.toHaveProperty('langfuse.trace.name');
+    });
+
+    it('falls back to agentType for trace name when no session id', () => {
+      const records = [
+        { 'user.id': 'jinwa', 'gen_ai.agent.type': 'qoder', 'gen_ai.turn.id': 't9' },
+      ] as unknown as AgentActivityEntry[];
+      const root = makeSpan('root-3', undefined, 'ENTRY');
+
+      (flusher as any).enrichLangfuseTraceFields(records, [root], 'qoder');
+
+      expect(root.attributes['langfuse.trace.name']).toBe('qoder');
+    });
+
+    it('promotes ENTRY conversation to root-span input/output + langfuse.trace.*', () => {
+      const inMsgs = [{ role: 'user', content: 'hello' }];
+      const outMsgs = [{ role: 'assistant', content: 'hi there' }];
+      const records = [
+        { } as unknown as AgentActivityEntry,
+        { 'gen_ai.input.messages': inMsgs, 'gen_ai.output.messages': outMsgs } as unknown as AgentActivityEntry,
+      ];
+      const root = makeSpan('root-4', undefined, 'ENTRY');
+
+      (flusher as any).enrichLangfuseTraceFields(records, [root], 'claude-code');
+
+      expect(root.attributes['gen_ai.input.messages']).toBe(inMsgs);
+      expect(root.attributes['gen_ai.output.messages']).toBe(outMsgs);
+      expect(root.attributes['langfuse.trace.input']).toBe(JSON.stringify(inMsgs));
+      expect(root.attributes['langfuse.trace.output']).toBe(JSON.stringify(outMsgs));
+    });
+  });
 });

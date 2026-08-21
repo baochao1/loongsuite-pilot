@@ -33,6 +33,60 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer install
 
 The Windows installer downloads `loongsuite-pilot.zip` by default. It stores data under `%USERPROFILE%\.loongsuite-pilot` and installs the `loongsuite-pilot` command under `%USERPROFILE%\.local\bin`. Open a new PowerShell window if the command is not found immediately after installation.
 
+## Offline Install On Windows (Offline Bundle)
+
+For machines **without network access**, build a self-contained offline bundle that includes the compiled app, all dependencies (`node_modules` with win32-x64 native binaries) and a Node.js runtime — the target machine needs no Node installed and never touches the network.
+
+### Build the offline bundle (on a networked Windows machine)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File deploy\package-offline-win.ps1
+```
+
+Output (under `out\offline\`):
+
+- `loongsuite-pilot-offline-win-x64\` — extracted bundle
+- `loongsuite-pilot-offline-win-x64-v<version>.zip` — single-file deliverable
+
+Script options:
+
+| Option | Description |
+|--------|-------------|
+| `-NodeVersion <ver>` | Node.js runtime version to bundle (default `22.22.2`). |
+| `-NodeUrl <url>` | Override the Node.js zip download URL. |
+| `-UseSystemNode` | Bundle the locally installed Node instead of downloading one. |
+| `-SkipBuild` | Skip `npm run build` (existing `dist/` is reused). |
+| `-SkipDeps` | Skip `npm ci` (existing `node_modules/` is reused). |
+| `-SkipZip` | Keep only the extracted bundle directory. |
+| `-OutDir <path>` | Output directory (default `<repo>\out\offline`). |
+
+### Install offline on the target machine
+
+Copy the bundle (or the unzipped zip) to the target machine, then:
+
+```powershell
+.\install-offline.ps1
+```
+
+Configure SLS output by appending the same options as a regular install, for example:
+
+```powershell
+.\install-offline.ps1 -SlsEndpoint "https://cn-hangzhou.log.aliyuncs.com" -SlsProject "my-project" -SlsLogstore "my-logstore" -SlsAkId "LTAI..." -SlsAkSecret "...."
+```
+
+Uninstall (from the bundle directory):
+
+```powershell
+.\uninstall-offline.ps1            # keep config & data
+.\uninstall-offline.ps1 -Purge     # remove config & data too
+```
+
+Notes:
+
+- The bundled Node.js runtime is copied into the data directory during install, so the bundle can be deleted afterwards.
+- The bundle must be kept intact (`package/`, `node/` and `installer-opensource.ps1` are all required).
+- Upgrading is just running a newer `install-offline.ps1` in place — config/data are preserved and rollback is automatic.
+
 ## Install With Common Options
 
 Linux/macOS:

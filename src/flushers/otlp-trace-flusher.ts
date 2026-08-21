@@ -611,6 +611,14 @@ export class OtlpTraceFlusher extends BaseFlusher {
         this.enrichOpenClawToolAttributes(records, spans);
         this.enrichOpenClawLlmAttributes(records, spans);
       }
+      // Make the produced spans render correctly in Langfuse. The converter emits
+      // ARMS/GenAI-semconv attributes (gen_ai.user.id, gen_ai.input/output.messages),
+      // but Langfuse reads trace-level fields (user, name, input, output) from its
+      // OWN namespace (langfuse.user.id / langfuse.trace.*) or from the ROOT span.
+      // Without this, Langfuse shows: empty User (Users module empty), "Unnamed
+      // trace", and null/undefined trace input & output even though data exists on
+      // child observations.
+      this.enrichLangfuseTraceFields(records, spans, agentType);
 
       const exportState = this.getOrCreateExportState(agentType, serviceName);
 
@@ -754,6 +762,93 @@ export class OtlpTraceFlusher extends BaseFlusher {
       if (typeof callId !== 'string') continue;
       const attributes = attributesByCallId.get(callId);
       if (attributes) Object.assign(span.attributes, attributes);
+    }
+  }
+
+  /**
+   * Bridge the ARMS/GenAI-semconv spans produced by the converter to Langfuse's
+   * OTLP field mapping. Langfuse derives trace-level fields from its OWN
+   * attribute namespace, which the converter never emits:
+   *   - trace user (userId)      <- langfuse.user.id | user.id
+   *   - trace name               <- langfuse.trace.name | root span name
+   *   - trace input / output     <- langfuse.trace.input/output | ROOT span I/O
+   * Without these, Langfuse shows an empty User (Users module empty), an
+   * "Unnamed trace", and null/undefined trace input & output, even though the
+   * underlying data lives on child observations.
+   */
+  private enrichLangfuseTraceFields(
+    records: AgentActivityEntry[],
+    spans: ReadableSpan[],
+    agentType: string,
+  ): void {
+    if (spans.length === 0) return;
+
+    // 1) user.id -> langfuse.user.id / user.id on the resource (so every span
+    //    carries it and Langfuse maps it to the trace user + Users module).
+    //    The value always comes from the entry record (InputManager already
+    //    enriches every entry with the configured user.id).
+    const userId = records
+      .map((r) => r['user.id'])
+      .find((v): v is string => typeof v === 'string' && v.length > 0);
+    if (userId) {
+      const resAttr = spans[0].resource?.attributes;
+      if (resAttr && typeof resAttr === 'object') {
+        resAttr['langfuse.user.id'] = userId;
+        resAttr['user.id'] = userId;
+      }
+      for (const span of spans) {
+        span.attributes['langfuse.user.id'] = userId;
+        span.attributes['user.id'] = userId;
+      }
+    }
+
+    // 1b) session.id -> resource + every span (value matches gen_ai.session.id)
+    //     so Langfuse can group/aggregate traces by session.
+    const sessionId = records
+      .map((r) => r['gen_ai.session.id'])
+      .find((v): v is string => typeof v === 'string' && v.length > 0)
+      ?? spans
+        .map((s) => s.attributes['gen_ai.session.id'])
+        .find((v): v is string => typeof v === 'string' && v.length > 0);
+    if (sessionId) {
+      const resAttr = spans[0].resource?.attributes;
+      if (resAttr && typeof resAttr === 'object') {
+        resAttr['session.id'] = sessionId;
+      }
+      for (const span of spans) {
+        span.attributes['session.id'] = sessionId;
+      }
+    }
+
+    // Identify the root span: the top-level span with no parent. Use
+    // sdk-trace-base's ReadableSpan field `parentSpanId`.
+    const rootSpan = spans.find((span) => !span.parentSpanId) ?? spans[0];
+
+    // 2) trace name -> langfuse.trace.name (root span). Prefer the session id,
+    //    then fall back to the agent type so it is never "Unnamed trace".
+    const traceName = sessionId ? `${agentType} · ${sessionId}` : agentType;
+    rootSpan.attributes['langfuse.trace.name'] = traceName;
+
+    // 3) trace input / output -> root span I/O + langfuse.trace.* from the
+    //    conversation carried in the ENTRY record (gen_ai.input/output.messages).
+    const entry = records.find((r) =>
+      r['gen_ai.input.messages'] !== undefined || r['gen_ai.output.messages'] !== undefined,
+    );
+    if (entry) {
+      const inMessages = entry['gen_ai.input.messages'];
+      const outMessages = entry['gen_ai.output.messages'];
+      if (inMessages !== undefined) {
+        rootSpan.attributes['gen_ai.input.messages'] = inMessages as unknown as never;
+        try {
+          rootSpan.attributes['langfuse.trace.input'] = JSON.stringify(inMessages);
+        } catch { /* ignore non-serializable payloads */ }
+      }
+      if (outMessages !== undefined) {
+        rootSpan.attributes['gen_ai.output.messages'] = outMessages as unknown as never;
+        try {
+          rootSpan.attributes['langfuse.trace.output'] = JSON.stringify(outMessages);
+        } catch { /* ignore non-serializable payloads */ }
+      }
     }
   }
 

@@ -49,11 +49,20 @@ param(
     [string]$CmsEndpoint,
     [string]$CmsWorkspace,
     [string]$ServiceNamePrefix,
+    # --- Langfuse (via OTLP trace) ---
+    # Langfuse ingestion uses OTLP over HTTP with Basic auth: Base64(publicKey:secretKey).
+    [string]$LangfuseEndpoint,
+    [string]$LangfusePublicKey,
+    [string]$LangfuseSecretKey,
+    [string]$LangfuseServiceName,
     [string]$Agents,
     [string]$MaskMode,
     [string]$MaskTypes,
     [switch]$Purge,
-    [switch]$PreferSystemNode
+    [switch]$PreferSystemNode,
+    # Offline install: local Node.js runtime directory (containing node.exe), bundled in the
+    # offline package. Used before any managed/system node resolution.
+    [string]$NodeRuntimeDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -388,6 +397,24 @@ function Ensure-NodeModules {
         Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+function Test-BundledNodeModules {
+    param([string]$AppDir)
+    $modulesDir = Join-Path $AppDir "node_modules"
+    if (-not (Test-Path $modulesDir)) { return $false }
+    # Marker file written by the offline packager (deploy/package-offline-win.ps1)
+    if (Test-Path (Join-Path $modulesDir ".pilot-modules-version")) { return $true }
+    # Fallback: every dependency declared in package.json must resolve locally
+    $pkgFile = Join-Path $AppDir "package.json"
+    if (-not (Test-Path $pkgFile)) { return $false }
+    try {
+        $pkg = Get-Content $pkgFile -Raw | ConvertFrom-Json
+        foreach ($prop in @($pkg.dependencies.PSObject.Properties)) {
+            if (-not (Test-Path (Join-Path $modulesDir $prop.Name))) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
 # <<< managed-node-runtime <<<
 
 # ============================================================
@@ -400,7 +427,28 @@ function Check-Deps {
     Msg "==> 检查依赖..." "==> Checking dependencies..."
 
     $script:NODE_BIN = ""
-    if ($PreferSystemNode) {
+    # Offline install: prefer the Node.js runtime bundled inside the offline package.
+    # It is copied into the data directory so the bundle can be deleted afterwards.
+    if ($NodeRuntimeDir -and (Test-Path (Join-Path $NodeRuntimeDir "node.exe"))) {
+        $offlineRuntimeDir = Join-Path $DataDir "runtime\offline-node"
+        $offlineNodeBin = Join-Path $offlineRuntimeDir "node.exe"
+        $needCopy = $true
+        if (Test-Path $offlineNodeBin) {
+            $prevEAP2 = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+            $offlineVer = & $offlineNodeBin --version 2>$null
+            $ErrorActionPreference = $prevEAP2
+            if ($offlineVer) { $needCopy = $false }
+        }
+        if ($needCopy) {
+            Msg "==> 使用离线包内置 Node.js 运行时，部署到数据目录..." `
+                "==> Using bundled Node.js runtime from offline package, deploying to data dir..."
+            if (Test-Path $offlineRuntimeDir) { Remove-Item $offlineRuntimeDir -Recurse -Force }
+            New-Item -ItemType Directory -Path $offlineRuntimeDir -Force | Out-Null
+            Copy-Item (Join-Path $NodeRuntimeDir "*") $offlineRuntimeDir -Recurse -Force
+            Msg "    ✅ Node 运行时已部署: $offlineRuntimeDir" "    ✅ Node runtime deployed: $offlineRuntimeDir"
+        }
+        $script:NODE_BIN = $offlineNodeBin
+    } elseif ($PreferSystemNode) {
         $script:NODE_BIN = Resolve-Node
         if (-not $script:NODE_BIN) { $script:NODE_BIN = Ensure-ManagedNode }
     } else {
@@ -462,6 +510,19 @@ function Check-Deps {
 $script:INSTALL_SRC = ""
 
 function Download-AndExtract {
+    # Offline install: PackageUrl may point at a local directory (the package/ folder
+    # inside the offline bundle). No download or extraction needed.
+    $localSrc = $PackageUrl
+    if ($PackageUrl -match '^file://') {
+        $localSrc = ($PackageUrl -replace '^file:/{2,3}', '') -replace '/', '\'
+    }
+    if ($localSrc -and (Test-Path -LiteralPath $localSrc -PathType Container)) {
+        Msg "==> 使用离线包本地目录作为安装源: $localSrc" "==> Using offline local directory as install source: $localSrc"
+        $script:INSTALL_SRC = $localSrc
+        $script:TMP_DIR = ""
+        return
+    }
+
     $tmpDir = Join-Path $env:TEMP "loongsuite-pilot-install-$(Get-Random)"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
     $script:TMP_DIR = $tmpDir
@@ -632,6 +693,66 @@ process.stdout.write(ids.join(','));
 }
 
 # ============================================================
+# Prompt for output target (Langfuse / SLS / none)
+# ============================================================
+function Prompt-OutputTarget {
+    # Skip entirely when SLS or Langfuse already fully provided on the command line.
+    $slsProvided = $SlsEndpoint -and ($SlsAkId -or $SlsApiKey) -and $SlsProject -and $SlsLogstore
+    if ($LangfuseEndpoint -and $LangfusePublicKey -and $LangfuseSecretKey) { return }
+    if ($slsProvided) { return }
+
+    $isInteractive = Test-CanPrompt
+    if (-not $isInteractive) {
+        # Non-interactive (e.g. piped stdin): only configure Langfuse when its flags
+        # were explicitly passed on the command line. $script:* are authoritative.
+        if ($LangfuseEndpoint) { $script:LangfuseEndpoint = $LangfuseEndpoint }
+        if ($LangfusePublicKey) { $script:LangfusePublicKey = $LangfusePublicKey }
+        if ($LangfuseSecretKey) { $script:LangfuseSecretKey = $LangfuseSecretKey }
+        if ($LangfuseServiceName) { $script:LangfuseServiceName = $LangfuseServiceName }
+        return
+    }
+
+    Write-Host ""
+    Msg "请选择数据输出目标 (Data Output Target):" "Select data output target:"
+    Msg "    1) Langfuse (推荐，通过 OTLP Trace 对接)" "    1) Langfuse (recommended, via OTLP trace)"
+    Msg "    2) 阿里云 SLS (需 AccessKey / API Key)" "    2) Alibaba Cloud SLS (needs AccessKey / API Key)"
+    Msg "    3) 暂不配置 (仅本地 JSONL / Dashboard)" "    3) Skip for now (local JSONL / Dashboard only)"
+    $choice = Read-Host "    请选择 [1/2/3，默认 1]"
+    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = "1" }
+
+    switch ($choice.Trim()) {
+        "1" {
+            $script:LangfuseEndpoint = if ($LangfuseEndpoint) { $LangfuseEndpoint } else { Read-Host "    Langfuse 接入地址 (例如 http://localhost:3000 或 https://cloud.langfuse.com)" }
+            $script:LangfusePublicKey = if ($LangfusePublicKey) { $LangfusePublicKey } else { Read-Host "    Langfuse Public Key" }
+            $script:LangfuseSecretKey = if ($LangfuseSecretKey) { $LangfuseSecretKey } else { Read-Host "    Langfuse Secret Key" }
+            $suggested = if ($env:USERNAME) { "loongsuite-pilot-$env:USERNAME" } else { "loongsuite-pilot" }
+            $snPrompt = Read-Host "    Service Name (可选, 默认 $suggested)"
+            $script:LangfuseServiceName = if ([string]::IsNullOrWhiteSpace($snPrompt)) { $suggested } else { $snPrompt.Trim() }
+            Msg "    ✅ 已选择 Langfuse 输出" "    ✅ Langfuse output selected"
+        }
+        "2" {
+            $script:SlsEndpoint = if ($SlsEndpoint) { $SlsEndpoint } else { Read-Host "    SLS Endpoint (例如 https://cn-hangzhou.log.aliyuncs.com)" }
+            $script:SlsProject = if ($SlsProject) { $SlsProject } else { Read-Host "    SLS Project" }
+            $script:SlsLogstore = if ($SlsLogstore) { $SlsLogstore } else { Read-Host "    SLS Logstore" }
+            if (-not $SlsApiKey) {
+                $akId = Read-Host "    SLS AccessKeyId (或留空改用 API Key)"
+                if ([string]::IsNullOrWhiteSpace($akId)) {
+                    $script:SlsApiKey = Read-Host "    SLS API Key"
+                } else {
+                    $script:SlsAkId = $akId
+                    $script:SlsAkSecret = Read-Host "    SLS AccessKeySecret"
+                }
+            }
+            Msg "    ✅ 已选择 SLS 输出" "    ✅ SLS output selected"
+        }
+        default {
+            Msg "    ⏭️ 暂不配置输出目标" "    ⏭️ No output target configured"
+        }
+    }
+    Write-Host ""
+}
+
+# ============================================================
 # Prompt for userId
 # ============================================================
 function Prompt-UserId {
@@ -666,8 +787,15 @@ try { const c=JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8')); p
         Msg "    当前 userId: $existingUid" "    Current userId: $existingUid"
         Msg "    直接回车保留，或输入新值:" "    Press Enter to keep, or type a new value:"
     } else {
-        Msg "    请输入你的 userId（用于数据归属，可直接回车跳过）:" `
-            "    Enter your userId (for data attribution, press Enter to skip):"
+        $suggested = ""
+        try { $suggested = [Environment]::GetEnvironmentVariable("USERNAME") } catch {}
+        if ($suggested) {
+            Msg "    请输入你的 userId（用于数据归属，直接回车则用本地用户名 '$suggested'）:" `
+                "    Enter your userId (for data attribution); press Enter to use local username '$suggested':"
+        } else {
+            Msg "    请输入你的 userId（用于数据归属，直接回车则自动生成兜底标识）:" `
+                "    Enter your userId (for data attribution); press Enter to auto-generate a fallback id:"
+        }
     }
     $rawInput = Read-Host "    >"
     $input = if ($null -eq $rawInput) { "" } else { $rawInput.Trim() }
@@ -676,6 +804,38 @@ try { const c=JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8')); p
     } elseif ($existingUid) {
         $script:UserId = $existingUid
     }
+    # When left empty, a fallback (local username / host+ip) is applied later in
+    # Write-Config, so the field is never blank in the emitted config.json.
+}
+
+# Resolve a fallback userId when none was provided: local username first,
+# then host name + primary IPv4 address.
+function Resolve-FallbackUserId {
+    $user = ""
+    try { $user = [Environment]::GetEnvironmentVariable("USERNAME") } catch {}
+    if ($user) { return $user }
+    $hostName = ""
+    try { $hostName = [Environment]::MachineName } catch {}
+    if (-not $hostName) {
+        try { $hostName = (& hostname 2>$null).Trim() } catch {}
+    }
+    $ip = ""
+    try {
+        $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+               Where-Object { $_.InterfaceAlias -notlike "*Loopback*" -and $_.IPAddress -ne "127.0.0.1" } |
+               Select-Object -First 1).IPAddress
+    } catch {}
+    if (-not $ip) {
+        try {
+            $ip = ([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+                   Where-Object { $_.AddressFamily -eq "InterNetwork" } |
+                   Select-Object -First 1).IPAddressToString
+        } catch {}
+    }
+    if ($hostName -and $ip) { return "$hostName-$ip" }
+    if ($hostName) { return $hostName }
+    if ($ip) { return $ip }
+    return "unknown"
 }
 
 # ============================================================
@@ -824,25 +984,32 @@ function Deploy-Package {
     Msg "==> 安装依赖..." "==> Installing dependencies..."
     $modulesVer = $ver
     if (-not $modulesVer) { if ($Version) { $modulesVer = $Version } else { $modulesVer = "latest" } }
-    $modulesFromOss = Ensure-NodeModules $modulesVer
-    if (-not $modulesFromOss) {
-        Msg "    ⚠️ 预编译 node_modules 不可用，回退 npm install" "    ⚠️ Prebuilt node_modules unavailable, falling back to npm install"
-        $nodeDir = Split-Path $script:NODE_BIN
-        $savedPath = $env:PATH
-        if ($env:PATH -notlike "*$nodeDir*") { $env:PATH = "$nodeDir;$env:PATH" }
-        Push-Location $script:PERMANENT_DIR
-        try {
-            $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
-            & $script:NPM_BIN install --omit=dev --omit=optional 2>&1 | Select-Object -Last 1
-            $npmExit = $LASTEXITCODE
-            $ErrorActionPreference = $prevEAP
-        } finally {
-            Pop-Location
-            $env:PATH = $savedPath
-        }
-        if ($npmExit -ne 0) {
-            Msg "❌ 依赖安装失败 (exit=$npmExit)，请检查 npm 日志" "❌ Dependencies installation failed (exit=$npmExit), check npm logs"
-            exit 1
+    $modulesFromOss = $false
+    $bundledModules = Test-BundledNodeModules $script:PERMANENT_DIR
+    if ($bundledModules) {
+        # Offline install: node_modules ships inside the package directory.
+        Msg "    ✅ 检测到离线内置 node_modules，跳过依赖下载" "    ✅ Bundled node_modules detected (offline install), skipping dependency download"
+    } else {
+        $modulesFromOss = Ensure-NodeModules $modulesVer
+        if (-not $modulesFromOss) {
+            Msg "    ⚠️ 预编译 node_modules 不可用，回退 npm install" "    ⚠️ Prebuilt node_modules unavailable, falling back to npm install"
+            $nodeDir = Split-Path $script:NODE_BIN
+            $savedPath = $env:PATH
+            if ($env:PATH -notlike "*$nodeDir*") { $env:PATH = "$nodeDir;$env:PATH" }
+            Push-Location $script:PERMANENT_DIR
+            try {
+                $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+                & $script:NPM_BIN install --omit=dev --omit=optional 2>&1 | Select-Object -Last 1
+                $npmExit = $LASTEXITCODE
+                $ErrorActionPreference = $prevEAP
+            } finally {
+                Pop-Location
+                $env:PATH = $savedPath
+            }
+            if ($npmExit -ne 0) {
+                Msg "❌ 依赖安装失败 (exit=$npmExit)，请检查 npm 日志" "❌ Dependencies installation failed (exit=$npmExit), check npm logs"
+                exit 1
+            }
         }
     }
 
@@ -858,6 +1025,8 @@ function Deploy-Package {
     Deploy-BootstrapScripts
     if ($modulesFromOss) {
         Msg "    ✅ 依赖安装完成（预编译 node_modules）" "    ✅ Dependencies installed (prebuilt node_modules)"
+    } elseif ($bundledModules) {
+        Msg "    ✅ 依赖安装完成（离线内置 node_modules）" "    ✅ Dependencies installed (offline bundled node_modules)"
     } else {
         Msg "    ✅ 依赖安装完成" "    ✅ Dependencies installed"
     }
@@ -929,13 +1098,17 @@ function Write-Config {
         slsAkSecret       = "$SlsAkSecret"
         slsApiKey         = "$SlsApiKey"
         logLevel          = "$LogLevel"
-        userId            = "$($script:UserId)"
+        userId            = "$(if ($script:UserId) { $script:UserId } else { Resolve-FallbackUserId })"
         collectLog        = "$CollectLog"
         collectTrace      = "$CollectTrace"
         cmsLicenseKey     = "$CmsLicenseKey"
         cmsEndpoint       = "$CmsEndpoint"
         cmsWorkspace      = "$CmsWorkspace"
         serviceNamePrefix = "$ServiceNamePrefix"
+        langfuseEndpoint  = "$($script:LangfuseEndpoint)"
+        langfusePublicKey = "$($script:LangfusePublicKey)"
+        langfuseSecretKey = "$($script:LangfuseSecretKey)"
+        langfuseServiceName = "$($script:LangfuseServiceName)"
         selectedAgents    = "$($script:SELECTED_AGENTS)"
         maskMode          = "$MaskMode"
         maskTypes         = "$MaskTypes"
@@ -1013,6 +1186,17 @@ if (opts.cmsLicenseKey || opts.cmsEndpoint || opts.cmsWorkspace) {
   if (opts.cmsWorkspace) config.cms.workspace = opts.cmsWorkspace;
 }
 if (opts.serviceNamePrefix) config.serviceNamePrefix = opts.serviceNamePrefix;
+if (opts.langfuseEndpoint && opts.langfusePublicKey && opts.langfuseSecretKey) {
+  config.collectTrace = true;
+  const base = String(opts.langfuseEndpoint).replace(/\/+$/, '');
+  config.otlpTrace = config.otlpTrace || {};
+  config.otlpTrace.endpoint = base + '/api/public/otel';
+  const basic = Buffer.from(opts.langfusePublicKey + ':' + opts.langfuseSecretKey).toString('base64');
+  config.otlpTrace.headers = config.otlpTrace.headers || {};
+  config.otlpTrace.headers.Authorization = 'Basic ' + basic;
+  if (opts.langfuseServiceName) config.otlpTrace.serviceName = opts.langfuseServiceName;
+  delete config.otlpTrace.disabled;
+}
 if (opts.maskMode) {
   config.mask = config.mask || {};
   config.mask.mode = opts.maskMode;
@@ -1816,6 +2000,7 @@ function Cmd-Install {
         Download-AndExtract
         Probe-Agents
         Select-Agents
+        Prompt-OutputTarget
         Prompt-UserId
         Confirm-ConfigOverwrite
         Deploy-Package $script:INSTALL_SRC

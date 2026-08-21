@@ -4,6 +4,9 @@ dist/
 *.tar.gz
 *.zip
 
+# Offline packaging output (deploy/package-offline-win.ps1)
+out/
+
 # OS
 .DS_Store
 Thumbs.db
