@@ -61,6 +61,10 @@ interface TurnBuffer {
   sessionId?: string;
   records: AgentActivityEntry[];
   completed: boolean;
+  // A turn that was superseded by a newer turn from the same session. We keep
+  // its buffer intact (instead of flushing it early) so the turn's own terminal
+  // event can still flush it with both input + output in a single upsert.
+  superseded?: boolean;
   lastActivityMs: number;
 }
 
@@ -274,8 +278,15 @@ export class OtlpTraceFlusher extends BaseFlusher {
     for (const [bufKey, buf] of this.turnBuffers) {
       if (buf.agentType !== agentType || bufKey === key || buf.completed) continue;
       if (!incomingSessionId || !buf.sessionId || incomingSessionId !== buf.sessionId) continue;
-      buf.completed = true;
-      this.triggerFlush(buf, false);
+      // Do NOT preemptively flush the superseded turn here. For agents whose
+      // turn self-terminates on an llm.response (opencode, openclaw, codex) the
+      // final generation's output arrives only AFTER the next turn has already
+      // started. Flushing now would export the turn with input but no output,
+      // while the late terminal response would open a fresh buffer carrying
+      // output only — leaving the Langfuse trace missing its input. Keep the
+      // buffer so the turn flushes on its own terminal event (or idle/hard-cap
+      // timeout) with input + output in the same upsert.
+      buf.superseded = true;
     }
 
     // Bounded cleanup: if buffers have accumulated past the hard cap (pathological
@@ -831,25 +842,66 @@ export class OtlpTraceFlusher extends BaseFlusher {
 
     // 3) trace input / output -> root span I/O + langfuse.trace.* from the
     //    conversation carried in the ENTRY record (gen_ai.input/output.messages).
-    const entry = records.find((r) =>
-      r['gen_ai.input.messages'] !== undefined || r['gen_ai.output.messages'] !== undefined,
-    );
-    if (entry) {
-      const inMessages = entry['gen_ai.input.messages'];
-      const outMessages = entry['gen_ai.output.messages'];
-      if (inMessages !== undefined) {
-        rootSpan.attributes['gen_ai.input.messages'] = inMessages as unknown as never;
-        try {
-          rootSpan.attributes['langfuse.trace.input'] = JSON.stringify(inMessages);
-        } catch { /* ignore non-serializable payloads */ }
-      }
-      if (outMessages !== undefined) {
-        rootSpan.attributes['gen_ai.output.messages'] = outMessages as unknown as never;
-        try {
-          rootSpan.attributes['langfuse.trace.output'] = JSON.stringify(outMessages);
-        } catch { /* ignore non-serializable payloads */ }
-      }
+    //    Resolve input and output independently: for a real turn the user entry
+    //    carries `gen_ai.input.messages` and the assistant/llm.response entry
+    //    carries `gen_ai.output.messages`, so a single `find` would miss the
+    //    output. Use the LAST occurrence of each so the trace reflects the most
+    //    complete input and the final assistant response.
+    let inEntry: AgentActivityEntry | undefined;
+    let outEntry: AgentActivityEntry | undefined;
+    for (const r of records) {
+      if (r['gen_ai.input.messages'] !== undefined) inEntry = r;
+      if (r['gen_ai.output.messages'] !== undefined) outEntry = r;
     }
+    if (inEntry) {
+      const inMessages = inEntry['gen_ai.input.messages'];
+      // Convert the canonical parts-based schema ({role, parts:[...]}) to
+      // standard ChatML ({role, content}) for Langfuse. Langfuse's compact
+      // trace-list view reads `content` directly; without it the whole Input
+      // is dropped (rendered as null). SLS keeps the canonical parts schema.
+      // The value MUST be a JSON *string*: the OTel SDK serializes a raw JS
+      // object/array attribute into an AnyValue kvlist, which Langfuse's
+      // trace-level input/output reader cannot parse (it shows garbled kvlist
+      // JSON). JSON.stringify keeps it a plain string the reader expects.
+      const inStr = JSON.stringify(this.toChatMLMessages(inMessages));
+      rootSpan.attributes['gen_ai.input.messages'] = inStr as unknown as never;
+      rootSpan.attributes['langfuse.trace.input'] = inStr as unknown as never;
+    }
+    if (outEntry) {
+      const outMessages = outEntry['gen_ai.output.messages'];
+      const outStr = JSON.stringify(this.toChatMLMessages(outMessages));
+      rootSpan.attributes['gen_ai.output.messages'] = outStr as unknown as never;
+      rootSpan.attributes['langfuse.trace.output'] = outStr as unknown as never;
+    }
+  }
+
+  /**
+   * Convert canonical parts-based messages
+   *   [{role, parts:[{type:"text", content}]}]
+   * to standard ChatML understood by Langfuse's compact IO rendering:
+   *   [{role, content}]
+   * Non-array / already content-based payloads pass through unchanged.
+   */
+  private toChatMLMessages(raw: unknown): unknown {
+    if (raw === undefined || raw === null) return raw;
+    if (!Array.isArray(raw)) return raw;
+    return raw.map((msg) => {
+      if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return msg;
+      const obj = msg as Record<string, unknown>;
+      if (!Array.isArray(obj.parts)) return msg;
+      const text = (obj.parts as unknown[])
+        .map((p) => {
+          if (!p || typeof p !== 'object' || Array.isArray(p)) return '';
+          const part = p as Record<string, unknown>;
+          return typeof part.content === 'string'
+            ? part.content
+            : JSON.stringify(part.content ?? p);
+        })
+        .filter((s) => s.length > 0)
+        .join('\n');
+      const { parts: _parts, ...rest } = obj;
+      return { ...rest, content: text };
+    });
   }
 
   private enrichOpenClawLlmAttributes(

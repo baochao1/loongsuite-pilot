@@ -769,19 +769,17 @@ try { const c=JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8')); p
         } catch {}
     }
 
-    # Reinstall preserves the existing identity without prompting. To change it,
-    # callers must pass -UserId explicitly; this keeps scripted installs fully
-    # non-interactive and avoids Read-Host failures in Windows PowerShell 5.1.
-    if ($existingUid) {
-        $script:UserId = $existingUid
-        return
-    }
-
     $isInteractive = Test-CanPrompt
     if (-not $isInteractive) {
+        # Non-interactive (e.g. piped stdin / scripted install): keep the existing
+        # identity if present, otherwise leave blank so Write-Config applies a
+        # fallback (local username / host+ip). No Read-Host to avoid failures.
+        if ($existingUid) { $script:UserId = $existingUid }
         return
     }
 
+    # Interactive: always ask, even on reinstall, so the operator can confirm or
+    # change the identity. -UserId on the command line still wins (early return).
     Write-Host ""
     if ($existingUid) {
         Msg "    当前 userId: $existingUid" "    Current userId: $existingUid"
