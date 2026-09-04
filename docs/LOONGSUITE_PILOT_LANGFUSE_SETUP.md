@@ -297,7 +297,7 @@ v1.4.1 的 collector 在 `src/core/orchestrator.ts` 的 `registerAllInputs()` �
 | 文件 | 改动 |
 |---|---|
 | `src/types/client-type.ts` | `ClientType` 枚举新增 `CodeBuddyHook = 'codebuddy'`（Hook-based tools 段） |
-| `src/inputs/codebuddy-hook/codebuddy-hook-input.ts` | **新增**，继承 `BaseHookInput`，消费 `logs/codebuddy/history/codebuddy-<date>.jsonl`，用 `buildCanonicalHookEntry(record, ClientType.CodeBuddy, ...)` 归一化，并 `enrichCanonicalEntryWithGit` |
+| `src/inputs/codebuddy-hook/codebuddy-hook-input.ts` | **新增**，继承 `BaseHookInput`，消费 `logs/codebuddy/history/codebuddy-<date>.jsonl`，用 `buildCanonicalHookEntry(record, ClientType.CodeBuddyHook, ...)` 归一化，并 `enrichCanonicalEntryWithGit` |
 | `src/core/orchestrator.ts` | import `CodeBuddyHookInput`；`LISTENER_AGENT_MAP` 加 `'codebuddy': 'codebuddy'`；在 workbuddy 注册段后**硬编码注册** codebuddy input + detection entry（enabled 默认 true，因 `config.json` 无 `agents` gate） |
 | `agents.d/codebuddy.json` | 新增，`input.type: "codebuddy-hook"`，`logDir: $PILOT_DATA/logs/codebuddy/history`，events 含 5 个 hook |
 | `assets/hooks/codebuddy-hook-event-writer.mjs` | **新增**，读取 CodeBuddy stdin payload，转成 **canonical JSONL**（`event.name` + `gen_ai.agent.type:'codebuddy'` + `gen_ai.*` + `agent.codebuddy.*`），追加到 `logs/codebuddy/history/codebuddy-<date>.jsonl` |
