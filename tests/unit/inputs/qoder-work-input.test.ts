@@ -195,6 +195,7 @@ describe('QoderWorkInput', () => {
         'gen_ai.session.id': 'sess-work',
         'gen_ai.output.messages': [{ role: 'assistant', parts: [{ type: 'text', content: 'hello work' }] }],
         'agent.source': 'qoder-transcript-hook',
+        'agent.qoderwork.cwd': '/workspace/qoder-work',
       };
       await fs.writeFile(logFile, JSON.stringify(record) + '\n');
 
@@ -210,6 +211,7 @@ describe('QoderWorkInput', () => {
         'gen_ai.agent.type': ClientType.QoderWork,
         'gen_ai.session.id': 'sess-work',
         'gen_ai.output.messages': [{ role: 'assistant', parts: [{ type: 'text', content: 'hello work' }] }],
+        'workspace.path': '/workspace/qoder-work',
       });
       await input.stop();
     });
@@ -450,6 +452,7 @@ describe('QoderWorkInput', () => {
         'event.name': 'llm.response',
         'gen_ai.agent.type': ClientType.QoderWork,
         'gen_ai.session.id': 'sess-ver',
+        version: '1.2.3',
         'agent.qoderwork.version': '1.2.3',
         'gen_ai.output.messages': [{ role: 'assistant', parts: [{ type: 'text', content: 'hi' }] }],
       };
@@ -461,6 +464,7 @@ describe('QoderWorkInput', () => {
       await input.start();
       expect(allEntries).toHaveLength(1);
       const entry = allEntries[0]!;
+      expect(entry['version']).toBeUndefined();
       expect(entry['agent.qoderwork.version']).toBe('1.2.3');
       expect(input.getAgentVersion()).toBe('1.2.3');
       await input.stop();

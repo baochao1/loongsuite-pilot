@@ -89,7 +89,7 @@ Shared vs. per-backend settings (spans are converted once per distinct `service.
 - **Shared across all backends:** `resourceAttributes`, `captureMessageContent`, `resourceAttributeKeys`, `spanAttributePassthroughPrefixes`, `maxExportBatchBytes`, `turnIdleTimeoutMs`.
 - **Per-backend:** endpoint URL, headers, compression, and `service.name` (see below — user vs. managed backends can differ).
 
-A failing backend is isolated — it does not block the healthy backends, and its failed spans are persisted separately under `~/.loongsuite-pilot/logs/otlp-failed/<service>-<agent>__<backend-name>.jsonl`.
+A failing backend is isolated — it does not block the healthy backends, and its failed spans are persisted separately under `~/.loongsuite-pilot/logs/otlp-failed/<service>-<agent>__<backend-name>-YYYY-MM-DD.jsonl`.
 
 ### Managed backends (`configs/inner/data_config.json`)
 
@@ -234,6 +234,23 @@ Open [http://localhost:3000](http://localhost:3000) and navigate to **Traces** t
 
 > **Note:** Langfuse uses HTTP for OTLP — gRPC (port 4317) is not supported. LLM message content is included in traces by default (`captureMessageContent` defaults to `true`). To disable it, explicitly set `captureMessageContent` to `false` in config.
 
+## Token Usage Aggregation
+
+Pilot reports token usage at two levels in an OTLP trace:
+
+- Each `LLM` span reports the usage of one model call.
+- The parent `AGENT` span reports the aggregate usage of the whole agent turn. Its token values equal the sum of its `LLM` children; they are not additional usage.
+
+This keeps both per-call details and a turn-level total available. However, a backend that calculates a trace total by summing usage across every span may count the same tokens twice. For example, Langfuse may add the `AGENT` aggregate to all child `LLM` values in its trace header.
+
+Use one level consistently when querying token usage:
+
+- For the total usage of one agent turn, read the `AGENT` span (`gen_ai.span.kind = AGENT`).
+- For per-call analysis, sum only the `LLM` spans (`gen_ai.span.kind = LLM`).
+- Do not add an `AGENT` span's usage to the usage of its descendant `LLM` spans.
+
+This caveat applies to OTLP trace backends that aggregate across a span hierarchy. SLS, JSONL, HTTP output, and the built-in status bar consume event records instead of summing both levels of the trace hierarchy.
+
 ## Content Capture In Traces
 
 Trace spans can carry sensitive content if message capture is enabled. For sensitive or team-managed setups, prefer:
@@ -303,6 +320,19 @@ Notes:
   { "otlpTrace": { "spanAttributePassthroughPrefixes": ["multica."] } }
   ```
 
+**Standard per-invocation identity.** `gen_ai.session.id` and `gen_ai.user.id` are the two exact reserved-key exceptions supported by `LOONGSUITE_PILOT_SPAN_ATTRIBUTES`:
+
+  ```bash
+  export LOONGSUITE_PILOT_SPAN_ATTRIBUTES="gen_ai.session.id=session-123,gen_ai.user.id=user-456"
+  ```
+
+- The values become the canonical event-log identity fields (`gen_ai.session.id` and `user.id`) and the standard trace-span attributes (`gen_ai.session.id` and `gen_ai.user.id`) on every span kind. No `spanAttributePassthroughPrefixes` entry is required.
+- Explicit per-invocation identity wins over the configured user id and agent-native identity. Native turn and step ids are not changed.
+- Phase-one support covers OpenCode, Claude Code, Qoder/Qoder-CN, and OpenClaw. Codex and Qwen Code CLI continue to reject these reserved keys.
+- Hermes additionally supports per-invocation `gen_ai.user.id`. For OpenClaw and Hermes, the final user-id precedence is: explicit `gen_ai.user.id` in `LOONGSUITE_PILOT_SPAN_ATTRIBUTES` → `LOONGSUITE_PILOT_USER_ID` / `LOONGSUITE_USER_ID` → channel-native `senderId` / `sender_id` (carried through the invocation transport field, so it wins over the collector-configured user id) → collector-configured user id → producer plugin configuration / hostname fallback. In a standard installation, the collector and plugin fallbacks normally read the same `config.json`.
+- Other supported agents retain the generic precedence and do not promote an agent-native identity above the collector-configured user id.
+- All other `gen_ai.*` and `user.*` keys remain reserved and are dropped.
+
 **Built-in OpenCode attribute (`opencode.message.id`).** The OpenCode plugin always stamps `opencode.message.id` (the opencode assistant-message id) on its `llm.request`, `llm.response`, `tool.call` and `tool.result` records — no launcher env var required. To surface it on spans, just list the `opencode.` prefix; it then appears on ENTRY / AGENT / STEP / LLM / TOOL spans (LLM and TOOL take the value from their own records; ENTRY / AGENT / STEP take the turn-level value):
 
   ```json
@@ -311,9 +341,9 @@ Notes:
 
 Notes:
 - Unlike source #2 (spans only), passthrough attributes are ordinary top-level record fields, so they appear in **both** the event log (SLS / JSONL) and the trace spans — same behavior as the git fields.
-- Reserved-prefix keys (`gen_ai.`, `git.`, `workspace.`, `event.`, `trace_`, `user.`, `cost_`, `agent.`) and sensitive names (token/secret/password/…) are dropped by the hook. Use a dedicated namespace such as `multica.*`.
+- Except for the two standard identity keys documented above, reserved-prefix keys (`gen_ai.`, `git.`, `workspace.`, `event.`, `trace_`, `user.`, `cost_`, `agent.`) and sensitive names (token/secret/password/…) are dropped by the hook. Use a dedicated namespace such as `multica.*`.
 - Values must not contain a comma `,` (it is the pair separator); a value is also capped at 512 chars.
-- Only keys matching a configured prefix are passed through; all other top-level fields are unaffected. Supported for claude-code, codex, qoder, qwen-code-cli, and opencode.
+- Only keys matching a configured prefix are passed through; all other top-level fields are unaffected. Generic passthrough is supported for claude-code, codex, qoder/qoder-cn, qwen-code-cli, opencode, and openclaw.
 - Codex snapshots these process-level attributes on `UserPromptSubmit` (with `Stop` as a fail-open fallback) and correlates them to transcript records by session and turn. This prevents a resumed session launched by a different invocation from reusing the previous invocation's attributes.
 - Qwen Code CLI captures them from the current `Stop` hook and clears any saved values when a resumed invocation does not provide the variable, preventing stale attributes from leaking into a later turn.
 
@@ -335,3 +365,11 @@ Failed trace export data may be persisted under:
 ```text
 ~/.loongsuite-pilot/logs/otlp-failed/
 ```
+
+Each JSONL record keeps the existing full span payload plus `_error`. Files use
+the local calendar date and are not split by size. Scheduled retention defaults to
+7 days. If managed files exceed the 512 MiB soft cleanup target, Pilot removes the
+oldest files while always retaining today and yesterday. The directory may exceed
+that target between cleanup runs. Legacy undated JSONL files are no longer appended
+and use their modification date for the same age and pressure cleanup. This lifecycle
+does not change OTLP retry, exporter, or healthy-backend behavior.

@@ -72,7 +72,7 @@ function toJsonValue(value: unknown): JsonValue | undefined {
 
 export class CodeBuddyHookInput extends BaseHookInput {
   readonly id = 'codebuddy';
-  readonly agentType = ClientType.CodeBuddy;
+  readonly agentType = ClientType.CodeBuddyHook;
 
   constructor(opts?: Partial<HookInputOptions> & { stateStore: HookInputOptions['stateStore'] }) {
     super({
@@ -98,7 +98,7 @@ export class CodeBuddyHookInput extends BaseHookInput {
     const hookEvent = getHookEvent(record, payload);
     const canonicalEntry = buildCanonicalHookEntry(
       record,
-      ClientType.CodeBuddy,
+      ClientType.CodeBuddyHook,
       buildAttributes(record, payload, hookEvent),
     );
     if (!canonicalEntry) return null;

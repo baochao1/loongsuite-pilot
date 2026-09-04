@@ -26,6 +26,7 @@ LoongSuite Pilot runs on a developer machine and collects telemetry from support
 | Codex | Hook | Yes | Yes | Yes | Yes |
 | Cursor | Hook | Yes | Yes | Yes | Yes |
 | Cursor CLI | Shared Cursor hook | Yes | Yes | Yes | Yes |
+| Grok Build | Hook + local session logs | Yes | Yes | Yes | Yes |
 | Hermes Agent | Native directory plugin | Yes | Yes | Yes | Yes |
 | Kiro CLI | Hook / local session polling | Yes | Yes | No | Yes |
 | MiMo Code | Plugin injection | Yes | Yes | Yes | Yes |
@@ -39,6 +40,7 @@ LoongSuite Pilot runs on a developer machine and collects telemetry from support
 | Qoder Work | Hook / local data polling | Yes | Yes | Yes | Yes |
 | Qoder Work CN | Hook / local data polling | Yes | Yes | Yes | Yes |
 | Qwen Code CLI | Hook | Yes | Yes | Yes | Yes |
+| Qwen Work CN | Hook / local data polling | Yes | Yes | Yes | Yes |
 | Wukong | CLI API polling | Yes | Yes | Yes | Yes |
 | WorkBuddy | Hook wakeup + local transcript watch/poll fallback | Yes | Yes | Yes | Yes |
 

@@ -18,6 +18,9 @@
 # Install a specific version:
 #   curl -fsSL <URL>/installer.sh | bash -s -- install --version 1.2.0
 #
+# Optional Dashboard port (default: 8765; preserve existing port on reinstall):
+#   curl -fsSL <URL>/installer.sh | bash -s -- install --dashboard-port 9000
+#
 # Upgrade (preserve config, auto-rollback on failure):
 #   curl -fsSL <URL>/installer.sh | bash -s -- upgrade
 #
@@ -55,6 +58,8 @@ SLS_AK_ID=""
 SLS_AK_SECRET=""
 SLS_API_KEY=""
 DATA_DIR="$DEFAULT_DATA_DIR"
+DASHBOARD_PORT=""
+DASHBOARD_PORT_SET=0
 LOG_LEVEL=""
 USER_ID=""
 COLLECT_LOG=""
@@ -102,6 +107,13 @@ while [[ $# -gt 0 ]]; do
         --package-url=*)      PACKAGE_URL="${1#--package-url=}"; shift ;;
         --data-dir)           DATA_DIR="$2"; shift 2 ;;
         --data-dir=*)         DATA_DIR="${1#*=}"; shift ;;
+        --dashboard-port)
+            if [ "$#" -lt 2 ] || [[ "$2" == --* ]]; then
+                echo "--dashboard-port requires an integer between 1 and 65535" >&2
+                exit 1
+            fi
+            DASHBOARD_PORT="$2"; DASHBOARD_PORT_SET=1; shift 2 ;;
+        --dashboard-port=*)   DASHBOARD_PORT="${1#*=}"; DASHBOARD_PORT_SET=1; shift ;;
         --log-level)          LOG_LEVEL="$2"; shift 2 ;;
         --log-level=*)        LOG_LEVEL="${1#*=}"; shift ;;
         --userId|--user.id)   USER_ID="$2"; shift 2 ;;
@@ -139,6 +151,13 @@ while [[ $# -gt 0 ]]; do
             exit 1 ;;
     esac
 done
+
+if [ "$DASHBOARD_PORT_SET" -eq 1 ]; then
+    if ! [[ "$DASHBOARD_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$DASHBOARD_PORT < 1 || 10#$DASHBOARD_PORT > 65535 )); then
+        echo "--dashboard-port must be an integer between 1 and 65535" >&2
+        exit 1
+    fi
+fi
 
 if [ -n "$MASK_MODE" ]; then
     case "$MASK_MODE" in
@@ -771,6 +790,7 @@ const checks = [
   { label: 'cms.endpoint',       oldVal: (old.cms||{}).endpoint||'',       newVal: newVals.cmsEndpoint },
   { label: 'cms.workspace',      oldVal: (old.cms||{}).workspace||'',      newVal: newVals.cmsWorkspace },
   { label: 'serviceNamePrefix',  oldVal: old.serviceNamePrefix||'',        newVal: newVals.serviceNamePrefix },
+  { label: 'dashboard.port',     oldVal: (old.dashboard||{}).port||'',    newVal: newVals.dashboardPort ? Number(newVals.dashboardPort) : '' },
   { label: 'mask.mode',          oldVal: (old.mask||{}).mode||'',          newVal: newVals.maskMode },
   { label: 'mask.types',         oldVal: Array.isArray((old.mask||{}).types) ? normalizeCsv(old.mask.types.join(',')) : '', newVal: normalizeCsv(newVals.maskTypes) },
 ];
@@ -781,8 +801,8 @@ if (!changed.length) process.exit(0);
 for (const c of changed) {
   console.log(c.label + ': ' + c.oldVal + ' -> ' + c.newVal);
 }
-" -- "$config_file" "$(printf '{"slsEndpoint":"%s","slsProject":"%s","slsLogstore":"%s","slsMode":"%s","cmsLicenseKey":"%s","cmsEndpoint":"%s","cmsWorkspace":"%s","serviceNamePrefix":"%s","maskMode":"%s","maskTypes":"%s"}' \
-        "$SLS_ENDPOINT" "$SLS_PROJECT" "$SLS_LOGSTORE" "$([ -n "$SLS_API_KEY" ] && echo "apiKey" || { [ -n "$SLS_AK_ID" ] && [ -n "$SLS_AK_SECRET" ] && echo "ak" || true; })" "$CMS_LICENSE_KEY" "$CMS_ENDPOINT" "$CMS_WORKSPACE" "$SERVICE_NAME_PREFIX" "$MASK_MODE" "$MASK_TYPES")" 2>/dev/null || true)
+" -- "$config_file" "$(printf '{"slsEndpoint":"%s","slsProject":"%s","slsLogstore":"%s","slsMode":"%s","cmsLicenseKey":"%s","cmsEndpoint":"%s","cmsWorkspace":"%s","serviceNamePrefix":"%s","dashboardPort":"%s","maskMode":"%s","maskTypes":"%s"}' \
+        "$SLS_ENDPOINT" "$SLS_PROJECT" "$SLS_LOGSTORE" "$([ -n "$SLS_API_KEY" ] && echo "apiKey" || { [ -n "$SLS_AK_ID" ] && [ -n "$SLS_AK_SECRET" ] && echo "ak" || true; })" "$CMS_LICENSE_KEY" "$CMS_ENDPOINT" "$CMS_WORKSPACE" "$SERVICE_NAME_PREFIX" "$DASHBOARD_PORT" "$MASK_MODE" "$MASK_TYPES")" 2>/dev/null || true)
 
     if [ -z "$diffs" ]; then return 0; fi
 
@@ -890,15 +910,39 @@ deploy_package() {
     echo ""
 
     msg "==> 部署 hook 脚本..." "==> Deploying hook scripts..."
-    if [ -f scripts/postinstall.js ]; then
-        "$NODE_BIN" scripts/postinstall.js || {
-            msg "    ❌ Hook 脚本部署失败" "    ❌ Hook script deployment failed"
+    if [ -f "$PERMANENT_DIR/scripts/postinstall.js" ]; then
+        # postinstall.js falls back to $HOME/.loongsuite-pilot when this is unset, so
+        # --data-dir would otherwise put hooks/skills/plugins in the default tree while
+        # the config lives elsewhere.
+        # Captured because two of the three failure modes are only in the output: a per-tree
+        # failure and a thrown main() both exit 0 on purpose (a non-zero exit would abort the
+        # npm install fallback above), announcing themselves as "N failed asset tree(s)" and
+        # "Post-install failed: <reason>" instead. 2>&1 because both go to stderr.
+        postinstall_exit=0
+        postinstall_out="$(LOONGSUITE_PILOT_DATA_DIR="$DATA_DIR" \
+            "$NODE_BIN" "$PERMANENT_DIR/scripts/postinstall.js" 2>&1)" || postinstall_exit=$?
+        # `if`, not `[ -n ... ] && printf`: under set -e the latter aborts the function when
+        # the output is empty.
+        if [ -n "$postinstall_out" ]; then
+            printf '%s\n' "$postinstall_out"
+        fi
+        if [ "$postinstall_exit" -ne 0 ]; then
+            msg "    ❌ Hook 脚本部署失败 (exit=$postinstall_exit)，hooks/plugins 缺失" \
+                "    ❌ Hook script deployment failed (exit=$postinstall_exit); hooks/plugins are missing"
             return 1
-        }
+        fi
+        if printf '%s' "$postinstall_out" | grep -qE "failed asset tree|Post-install failed"; then
+            msg "    ❌ Hook 脚本部分部署失败（见上方输出），hooks/plugins 缺失" \
+                "    ❌ Some hook asset trees failed to deploy (see the output above); hooks/plugins are missing"
+            return 1
+        fi
+        msg "    ✅ Hook 脚本已部署" "    ✅ Hook scripts deployed"
+        msg "    如使用 Codex 桌面版，首次启动需在桌面端手动信任 hooks" \
+            "    If using Codex desktop app, please manually trust hooks on first launch"
+    else
+        msg "    ⚠️ postinstall.js 未找到，跳过 Hook 部署" \
+            "    ⚠️ postinstall.js not found, skipping hook deployment"
     fi
-    msg "    ✅ Hook 脚本已部署" "    ✅ Hook scripts deployed"
-    msg "    如使用 Codex 桌面版，首次启动需在桌面端手动信任 hooks" \
-        "    If using Codex desktop app, please manually trust hooks on first launch"
     echo ""
 
     # Write current pointer only after all deploy steps succeed
@@ -958,6 +1002,7 @@ write_config() {
     printf '%s' "$PROBE_RESULT" | \
         LP_SLS_API_KEY="$SLS_API_KEY" \
         LP_SELECTED_AGENTS="$SELECTED_AGENTS" \
+        LP_DASHBOARD_PORT="$DASHBOARD_PORT" \
         "$NODE_BIN" -e "
 const fs = require('fs');
 const path = '$config_file';
@@ -973,6 +1018,8 @@ const config = {
 if (!config.dashboard || typeof config.dashboard !== 'object' || Array.isArray(config.dashboard)) {
   config.dashboard = {};
 }
+const dashboardPort = process.env.LP_DASHBOARD_PORT || '';
+if (dashboardPort) config.dashboard.port = Number(dashboardPort);
 if (config.dashboard.port === undefined) config.dashboard.port = 8765;
 delete config.internal;
 if (config.userId === undefined && config['user.id'] !== undefined) {
@@ -1796,6 +1843,97 @@ print_summary() {
     echo "============================================================"
 }
 
+# >>> pilot-stop-for-deploy >>>
+# Overlay `install` used to SIGTERM only the collector pid file. The updater
+# stayed up, and gcOldVersions() deletes any versions/<dir> that is not
+# current/previous -- including the directory this deploy just copied, before
+# current is published. installer-opensource.sh writes current after
+# node_modules + postinstall, so that window is minutes. `loongsuite-pilot stop`
+# unloads LaunchAgent / disables systemd (autostart_remove) so neither process
+# comes back mid-deploy. That is the Unix counterpart of Disable-ScheduledTask.
+#
+# stop deletes the unit files. restore_pilot_after_deploy (EXIT trap) is the
+# counterpart of Enable-ScheduledTask in finally: it re-registers autostart
+# via start. Container installs must not start a daemon in the build layer.
+#
+# Fresh install has no CLI yet. Fall back to both pid files so a leftover
+# collector or updater still goes down.
+# All CLI after stop must go through run_pilot_cli so --data-dir matches.
+PILOT_HELD_FOR_DEPLOY=0
+
+resolve_pilot_cli() {
+    if command -v loongsuite-pilot &>/dev/null; then
+        command -v loongsuite-pilot
+    elif [ -f "$HOME/.local/bin/loongsuite-pilot" ]; then
+        printf '%s\n' "$HOME/.local/bin/loongsuite-pilot"
+    fi
+}
+
+run_pilot_cli() {
+    local cli
+    cli="$(resolve_pilot_cli)"
+    [ -n "$cli" ] || return 1
+    # deploy_package writes versions/current under $HOME/.loongsuite-pilot
+    # (the CLI cache default). Do not point CACHE_DIR at DATA_DIR.
+    LOONGSUITE_PILOT_DATA_DIR="$DATA_DIR" \
+        "$cli" "$@"
+}
+
+stop_one_pilot_pid_file() {
+    local pid_file="$1"
+    [ -f "$pid_file" ] || return 0
+    local old_pid
+    old_pid=$(cat "$pid_file")
+    if kill -0 "$old_pid" 2>/dev/null; then
+        kill "$old_pid" 2>/dev/null || true
+        local count=0
+        while kill -0 "$old_pid" 2>/dev/null && [ $count -lt 10 ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if kill -0 "$old_pid" 2>/dev/null; then
+            kill -9 "$old_pid" 2>/dev/null || true
+        fi
+        rm -f "$pid_file"
+    else
+        rm -f "$pid_file"
+    fi
+}
+
+stop_pilot_for_deploy() {
+    PILOT_HELD_FOR_DEPLOY=0
+    local cli
+    cli="$(resolve_pilot_cli)"
+
+    if [ -z "$cli" ] && [ ! -f "$DATA_DIR/loongsuite-pilot.pid" ] && [ ! -f "$DATA_DIR/loongsuite-pilot-updater.pid" ]; then
+        return 0
+    fi
+
+    msg "==> 停止服务..." "==> Stopping service..."
+    if [ -n "$cli" ]; then
+        PILOT_HELD_FOR_DEPLOY=1
+        if ! run_pilot_cli stop; then
+            msg "    ⚠️  无法停止服务，覆盖安装期间 updater 可能仍会 GC" \
+                "    ⚠️  Could not stop the service; updater may still GC during this overlay"
+        fi
+    fi
+    # Leftovers: no CLI on PATH, or an updater the CLI did not track.
+    stop_one_pilot_pid_file "$DATA_DIR/loongsuite-pilot.pid"
+    stop_one_pilot_pid_file "$DATA_DIR/loongsuite-pilot-updater.pid"
+    echo ""
+}
+
+restore_pilot_after_deploy() {
+    [ "${PILOT_HELD_FOR_DEPLOY:-0}" -eq 1 ] || return 0
+    [ "${INSTALL_MODE:-host}" = "container" ] && return 0
+    PILOT_HELD_FOR_DEPLOY=0
+    if ! run_pilot_cli start; then
+        msg "    ⚠️  无法恢复自启，请手动运行: loongsuite-pilot start" \
+            "    ⚠️  Could not restore autostart, run manually: loongsuite-pilot start"
+    fi
+}
+# <<< pilot-stop-for-deploy <<<
+
 # ============================================================
 # CMD: install
 # ============================================================
@@ -1818,38 +1956,24 @@ cmd_install() {
         echo ""
     fi
 
-    # Stop running service before re-install
-    local pid_file="$DATA_DIR/loongsuite-pilot.pid"
-    if [ -f "$pid_file" ]; then
-        local old_pid
-        old_pid=$(cat "$pid_file")
-        if kill -0 "$old_pid" 2>/dev/null; then
-            msg "==> 停止运行中的服务 (PID $old_pid)..." \
-                "==> Stopping running service (PID $old_pid)..."
-            kill "$old_pid" 2>/dev/null || true
-            local count=0
-            while kill -0 "$old_pid" 2>/dev/null && [ $count -lt 10 ]; do
-                sleep 1
-                count=$((count + 1))
-            done
-            if kill -0 "$old_pid" 2>/dev/null; then
-                kill -9 "$old_pid" 2>/dev/null || true
-            fi
-            rm -f "$pid_file"
-            msg "    ✅ 已停止" "    ✅ Stopped"
-            echo ""
-        else
-            rm -f "$pid_file"
-        fi
-    fi
-
-    trap 'rm -rf "${TMP_DIR:-}"' EXIT
+    # Stop collector AND updater, and unload launchd / disable systemd so GC
+    # cannot delete the in-flight versions dir. See stop_pilot_for_deploy.
+    # Arm restore before stop: autostart_remove is not reversible if we die
+    # between stop and trap.
+    trap 'restore_pilot_after_deploy; rm -rf "${TMP_DIR:-}"' EXIT
+    stop_pilot_for_deploy
     download_and_extract
     probe_agents
     select_agents
     prompt_user_id
     confirm_config_overwrite
-    deploy_package "$INSTALL_SRC"
+    # set -e would end the install here anyway; saying why beats an exit code on its own.
+    if ! deploy_package "$INSTALL_SRC"; then
+        echo ""
+        msg "❌ 安装中止：hook 脚本部署失败，请检查上方输出后重试" \
+            "❌ Install aborted: hook script deployment failed; check the output above and retry"
+        exit 1
+    fi
     write_config
     install_loongsuite_pilot_command
     inject_qodercli_token_intercept
@@ -1857,11 +1981,12 @@ cmd_install() {
     inject_claude_code_fetch_intercept
 
     msg "==> 启动服务..." "==> Starting service..."
-    if loongsuite-pilot start; then
+    if run_pilot_cli start; then
         sleep 2
         local _status_out
-        _status_out="$(loongsuite-pilot status 2>/dev/null || true)"
+        _status_out="$(run_pilot_cli status 2>/dev/null || true)"
         if echo "$_status_out" | grep -q "is running"; then
+            PILOT_HELD_FOR_DEPLOY=0
             msg "    ✅ 服务已启动" "    ✅ Service started"
         else
             msg "    ⚠️  服务可能尚未就绪，请检查: loongsuite-pilot status" \
@@ -1902,7 +2027,7 @@ cmd_upgrade() {
 
     check_deps
 
-    trap 'rm -rf "${TMP_DIR:-}"' EXIT
+    trap 'restore_pilot_after_deploy; rm -rf "${TMP_DIR:-}"' EXIT
     download_and_extract
 
     local new_ver; new_ver=$(get_version_from_dir "$INSTALL_SRC")
@@ -1919,14 +2044,7 @@ cmd_upgrade() {
         "   New version: ${new_ver:-unknown} (${new_commit:-unknown})"
     echo ""
 
-    # Stop the running service
-    msg "==> 停止服务..." "==> Stopping service..."
-    if command -v loongsuite-pilot &>/dev/null; then
-        loongsuite-pilot stop 2>/dev/null || true
-    elif [ -f "$HOME/.local/bin/loongsuite-pilot" ]; then
-        "$HOME/.local/bin/loongsuite-pilot" stop 2>/dev/null || true
-    fi
-    echo ""
+    stop_pilot_for_deploy
 
     # Deploy new version to versions/<ver>_<commit>/
     # Old version stays untouched; deploy_package writes current/previous pointers
@@ -1935,16 +2053,12 @@ cmd_upgrade() {
         msg "⚠️  部署失败，正在回滚到旧版本..." \
             "⚠️  Deployment failed, rolling back to old version..."
         local _rollback_ok=1
-        if command -v loongsuite-pilot &>/dev/null; then
-            loongsuite-pilot rollback 2>/dev/null || _rollback_ok=0
-        elif [ -f "$HOME/.local/bin/loongsuite-pilot" ]; then
-            "$HOME/.local/bin/loongsuite-pilot" rollback 2>/dev/null || _rollback_ok=0
-        fi
+        run_pilot_cli rollback 2>/dev/null || _rollback_ok=0
         if [ "$_rollback_ok" -eq 1 ]; then
-            if command -v loongsuite-pilot &>/dev/null; then
-                loongsuite-pilot start 2>/dev/null || _rollback_ok=0
-            elif [ -f "$HOME/.local/bin/loongsuite-pilot" ]; then
-                "$HOME/.local/bin/loongsuite-pilot" start 2>/dev/null || _rollback_ok=0
+            if run_pilot_cli start; then
+                PILOT_HELD_FOR_DEPLOY=0
+            else
+                _rollback_ok=0
             fi
         fi
         if [ "$_rollback_ok" -eq 1 ]; then
@@ -1962,11 +2076,12 @@ cmd_upgrade() {
 
     # Start the new version
     msg "==> 启动新版本..." "==> Starting new version..."
-    if loongsuite-pilot start; then
+    if run_pilot_cli start; then
         sleep 2
         local _status_out
-        _status_out="$(loongsuite-pilot status 2>/dev/null || true)"
+        _status_out="$(run_pilot_cli status 2>/dev/null || true)"
         if echo "$_status_out" | grep -q "is running"; then
+            PILOT_HELD_FOR_DEPLOY=0
             msg "    ✅ 新版本启动成功" "    ✅ New version started successfully"
             echo ""
 
@@ -1983,19 +2098,23 @@ cmd_upgrade() {
     msg "⚠️  新版本启动失败，正在回滚..." \
         "⚠️  New version failed to start, rolling back..."
 
-    loongsuite-pilot stop 2>/dev/null || true
+    run_pilot_cli stop 2>/dev/null || true
 
     local _rb_ok=1
-    if command -v loongsuite-pilot &>/dev/null; then
-        loongsuite-pilot rollback 2>/dev/null || _rb_ok=0
-    else
-        "$HOME/.local/bin/loongsuite-pilot" rollback 2>/dev/null || _rb_ok=0
-    fi
+    run_pilot_cli rollback 2>/dev/null || _rb_ok=0
 
     if [ "$_rb_ok" -eq 1 ]; then
-        msg "❌ 升级失败，已回滚到 v${old_ver:-unknown}" \
-            "❌ Upgrade failed, rolled back to v${old_ver:-unknown}"
-        msg "   请检查日志: loongsuite-pilot log" "   Check logs: loongsuite-pilot log"
+        if run_pilot_cli start; then
+            PILOT_HELD_FOR_DEPLOY=0
+            msg "❌ 升级失败，已回滚到 v${old_ver:-unknown}" \
+                "❌ Upgrade failed, rolled back to v${old_ver:-unknown}"
+            msg "   请检查日志: loongsuite-pilot log" "   Check logs: loongsuite-pilot log"
+        else
+            msg "❌ 升级失败，已回滚但未能重启服务" \
+                "❌ Upgrade failed, rolled back but could not restart"
+            msg "   请手动运行: loongsuite-pilot start" \
+                "   Run manually: loongsuite-pilot start"
+        fi
     else
         msg "❌ 升级失败且回滚未成功，请手动恢复:" \
             "❌ Upgrade failed and rollback did not succeed. Manual recovery:"
@@ -2113,6 +2232,70 @@ try {
             msg "    ⚠️  跳过: $short (需手动清理)" "    ⚠️  Skipped: $short (manual cleanup needed)"
         fi
     done
+}
+
+# Grok Build uses a dedicated Pilot-owned hook file. Match the stable entry
+# script name instead of the data-dir path so custom LOONGSUITE_PILOT_DATA_DIR
+# installations uninstall correctly, while unrelated hooks in the file remain.
+remove_grok_build_hook_config() {
+    local cfg="$HOME/.grok/hooks/loongsuite-pilot.json"
+    [ -f "$cfg" ] || return 0
+    if ! command -v node &>/dev/null; then
+        msg "    ⚠️  跳过: ~/.grok/hooks/loongsuite-pilot.json (无 Node.js，请手动清理 Grok Build Pilot hook)" \
+            "    ⚠️  Skipped: ~/.grok/hooks/loongsuite-pilot.json (Node.js unavailable; remove the Grok Build Pilot hook manually)"
+        return 0
+    fi
+
+    local result
+    result="$(node -e '
+const fs = require("fs");
+const cfg = process.argv[1];
+const owned = value => typeof value === "string"
+  && /(?:^|[\\/])grok-build-loongsuite-pilot-hook\.(?:sh|ps1)(?:"|\s|$)/i.test(value);
+try {
+  const data = JSON.parse(fs.readFileSync(cfg, "utf8"));
+  const hooks = data && typeof data.hooks === "object" && data.hooks ? data.hooks : null;
+  if (!hooks) { process.stdout.write("nochange"); process.exit(0); }
+  let changed = false;
+  for (const [event, entries] of Object.entries(hooks)) {
+    if (!Array.isArray(entries)) continue;
+    const kept = [];
+    for (const entry of entries) {
+      if (owned(entry && entry.command)) { changed = true; continue; }
+      if (entry && Array.isArray(entry.hooks)) {
+        const nested = entry.hooks.filter(hook => !owned(hook && hook.command));
+        if (nested.length !== entry.hooks.length) changed = true;
+        if (entry.hooks.length > 0 && nested.length === 0) continue;
+        kept.push({ ...entry, hooks: nested });
+      } else {
+        kept.push(entry);
+      }
+    }
+    if (kept.length === 0) delete hooks[event];
+    else hooks[event] = kept;
+  }
+  if (!changed) { process.stdout.write("nochange"); process.exit(0); }
+  if (Object.keys(hooks).length === 0) delete data.hooks;
+  if (Object.keys(data).length === 0) {
+    fs.unlinkSync(cfg);
+  } else {
+    const tmp = `${cfg}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, cfg);
+  }
+  process.stdout.write("cleaned");
+} catch (error) {
+  process.stderr.write(error.message); process.exit(1);
+}
+' "$cfg" 2>/dev/null || true)"
+
+    if [ "$result" = "cleaned" ] || [ "$result" = "nochange" ]; then
+        msg "    ✅ 已清理: ~/.grok/hooks/loongsuite-pilot.json" \
+            "    ✅ Cleaned: ~/.grok/hooks/loongsuite-pilot.json"
+    else
+        msg "    ⚠️  跳过: ~/.grok/hooks/loongsuite-pilot.json (需手动清理)" \
+            "    ⚠️  Skipped: ~/.grok/hooks/loongsuite-pilot.json (manual cleanup needed)"
+    fi
 }
 
 # ============================================================
@@ -2694,6 +2877,7 @@ cmd_uninstall() {
     # Remove hook entries from tool configs BEFORE removing install dir
     msg "==> 清理 hook 配置..." "==> Cleaning up hook configs..."
     remove_hook_configs
+    remove_grok_build_hook_config
     remove_qodercli_token_intercept
     remove_qoderwork_runtime_wrapper
     remove_claude_code_fetch_intercept

@@ -43,7 +43,10 @@ const RESOURCE_ATTRIBUTE_FIELDS = Object.keys(RESOURCE_ATTRIBUTES).length > 0
   : {};
 // Caller-supplied span attributes (e.g. multica.*) stamped as top-level record
 // fields so the trace flusher can pass matching keys through to span attributes.
-const SPAN_ATTRIBUTES = parseSpanAttributesFromEnv(process.env, { agentId: 'qoder' });
+const SPAN_ATTRIBUTES = parseSpanAttributesFromEnv(process.env, {
+  agentId: 'qoder',
+  allowInvocationIdentity: true,
+});
 
 // --- Per-transcript processing lock -----------------------------------------
 // Every Stop can create a detached retry. Serialize the complete read -> append
@@ -718,7 +721,7 @@ export function findIncrementalTurnEndLine(snapshot, startLine, scanEndLine) {
       sawStop = true;
     } else if (sawStop && (
       hookEvent === 'UserPromptSubmit' ||
-      (row.type === 'user' && !isToolResult(row))
+      isRealUserPrompt(row)
     )) {
       // `last_line_count` is the next unread zero-based line index. Returning
       // the prompt line itself consumes the prior Stop/session metadata while
@@ -727,6 +730,29 @@ export function findIncrementalTurnEndLine(snapshot, startLine, scanEndLine) {
     }
   }
   return scanEndLine;
+}
+
+// Anthropic's stop_reason mixes turn-terminal values with mid-turn ones.
+// `tool_use` and `pause_turn` both mean the assistant resumes after a tool
+// result or a server-side pause, so neither ends the turn. Treating every
+// stop_reason as a boundary makes a mid-flight snapshot look finished, and
+// assessStableEofCandidate can then promote that prefix to a commit.
+// `stop_sequence` and `refusal` are terminal and must stay in this set: on real
+// transcripts stop_sequence is sometimes the turn's only terminal row, so
+// dropping it would turn an early commit into no commit at all.
+const TERMINAL_STOP_REASONS = new Set([
+  'end_turn',
+  'max_tokens',
+  'stop_sequence',
+  'refusal',
+  // Generic spellings, in case a future Qoder build normalizes before writing.
+  'stop',
+  'cancelled',
+  'error',
+]);
+
+function isTerminalStopReason(reason) {
+  return typeof reason === 'string' && TERMINAL_STOP_REASONS.has(reason);
 }
 
 export function findTriggeredTurnWindow(snapshot, triggerEndLine) {
@@ -757,7 +783,7 @@ export function findTriggeredTurnWindow(snapshot, triggerEndLine) {
     }
     if (triggerPromptLine < 0) {
       for (let i = triggerLimit - 1; i >= 0; i--) {
-        if (rows[i]?.type === 'user' && !isToolResult(rows[i])) {
+        if (isRealUserPrompt(rows[i])) {
           triggerPromptLine = i;
           break;
         }
@@ -766,20 +792,49 @@ export function findTriggeredTurnWindow(snapshot, triggerEndLine) {
     if (triggerPromptLine < 0) return waiting('prompt-not-found');
 
     let stopLine = -1;
+    let stopSource = null;
+    let assistantStopLine = -1;
     for (let i = triggerPromptLine + 1; i < limit; i++) {
       const hookEvent = hookEventOf(rows[i]);
       if (hookEvent === 'Stop') {
         stopLine = i;
+        stopSource = 'progress-stop';
         break;
+      }
+      if (
+        assistantStopLine < 0
+        && rows[i]?.type === 'assistant'
+        && isTerminalStopReason(rows[i]?.message?.stop_reason)
+      ) {
+        // Remember it but keep scanning: when a turn carries both signals the
+        // progress Stop is the boundary the pre-B3 path used, and it sits after
+        // the final assistant row.
+        assistantStopLine = i;
+        continue;
       }
       if (i >= triggerLimit && (
         hookEvent === 'UserPromptSubmit' ||
-        (rows[i]?.type === 'user' && !isToolResult(rows[i]))
+        isRealUserPrompt(rows[i])
       )) {
-        return waiting('next-prompt-before-stop');
+        // The next prompt ends this turn, so the search for a progress Stop must
+        // not cross it — otherwise it would adopt the *next* turn's Stop. The
+        // triggerLimit guard is what keeps this turn's own user row from reading
+        // as that next prompt: it sits just after the UserPromptSubmit progress
+        // row, inside the trigger snapshot. A terminal assistant row already seen
+        // is still a valid Stop; without one there is nothing to commit yet.
+        if (assistantStopLine < 0) return waiting('next-prompt-before-stop');
+        break;
       }
     }
+    if (stopLine < 0 && assistantStopLine >= 0) {
+      stopLine = assistantStopLine;
+      stopSource = 'assistant-stop-reason';
+    }
     if (stopLine < 0) return waiting('stop-not-found');
+    logDebug(
+      'qoder',
+      `Stop detected at line ${stopLine} (source: ${stopSource}) for prompt at line ${triggerPromptLine}`,
+    );
 
     // Resolve the start from the actual Stop instead of trusting a global
     // cursor that may have been reset by redeployment.
@@ -792,7 +847,7 @@ export function findTriggeredTurnWindow(snapshot, triggerEndLine) {
     }
     if (startLine < 0) {
       for (let i = stopLine - 1; i >= 0; i--) {
-        if (rows[i]?.type === 'user' && !isToolResult(rows[i])) {
+        if (isRealUserPrompt(rows[i])) {
           startLine = i;
           break;
         }
@@ -822,7 +877,7 @@ export function findTriggeredTurnWindow(snapshot, triggerEndLine) {
       }
       if (
         hookEvent === 'UserPromptSubmit' ||
-        (rows[i]?.type === 'user' && !isToolResult(rows[i]))
+        isRealUserPrompt(rows[i])
       ) {
         // The next real prompt is itself an unambiguous right boundary for the
         // completed Stop turn. Exclude it from this fixed window so its own Stop
@@ -974,7 +1029,8 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
   const observedTs = timestampToUnixNanos(Date.now());
 
   // Find user prompt
-  const userRow = contentEvents.find(r => r.type === 'user' && !isToolResult(r));
+  const userRow = contentEvents.find(isRealUserPrompt)
+    || contentEvents.find(r => r.type === 'user' && !isToolResult(r));
   const userId = resolveUserId(userRow || contentEvents[0], runtimeConfig);
   const agentType = inferVariant(userRow || contentEvents[0], agentId);
   const providerName = inferProviderName({ 'gen_ai.agent.type': agentType });
@@ -993,19 +1049,25 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
         'gen_ai.provider.name': providerName,
         'gen_ai.request.model': userHookModel,
         'user.id': userId,
-        'gen_ai.input.messages_delta': [{ role: 'user', parts: [{ type: 'text', content: userText }] }],
+        'gen_ai.input.messages_delta': [{ role: 'user', parts: buildUserMessageParts(userText, contentEvents, agentType) }],
         'agent.source': 'qoder-transcript-hook',
         'agent.qoder.raw_type': 'user',
         'agent.qoder.content_type': 'text',
         time_unix_nano: timestampToUnixNanos(userRow.timestamp),
         observed_time_unix_nano: observedTs,
+        ...cliAttachmentFields(agentType, userRow, allParsed),
       });
     }
   }
 
-  // If no progress boundaries detected, fall back to legacy behavior
+  // If no progress boundaries detected, fall back to legacy behavior. The turn
+  // entry `other` is already in `records`, so hand the legacy path only the rows
+  // it still owns. Qoder encodes tool results as type=user, so they must survive.
   if (boundaries.length === 0) {
-    const legacyRecords = buildLegacyEvents(contentEvents, turnId, sessionId, agentId, runtimeConfig, records, observedTs);
+    const residualEvents = contentEvents.filter(
+      row => row.type === 'assistant' || isToolResult(row),
+    );
+    const legacyRecords = buildLegacyEvents(residualEvents, turnId, sessionId, agentId, runtimeConfig, records, observedTs);
     return finalizeRecords(legacyRecords, cwd);
   }
 
@@ -1040,7 +1102,7 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
     let inputDelta;
     let emitRequest = i > 0;
     if (i === 0 && userRow) {
-      inputDelta = [{ role: 'user', parts: [{ type: 'text', content: extractUserText(userRow) }] }];
+      inputDelta = [{ role: 'user', parts: buildUserMessageParts(extractUserText(userRow), contentEvents, agentType) }];
       emitRequest = true;
     } else if (inputToolResults.length > 0) {
       inputDelta = [];
@@ -1076,6 +1138,7 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
         'agent.source': 'qoder-transcript-hook',
         time_unix_nano: startNanos,
         observed_time_unix_nano: observedTs,
+        ...(i === 0 ? cliAttachmentFields(agentType, userRow, allParsed) : {}),
       });
     }
 
@@ -1083,6 +1146,7 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
     const outputParts = [];
     const toolCalls = [];
     let responseId = undefined;
+    let clientRequestId = undefined;
     let lastAssistantTs = null;
     let firstAssistantTs = null;
 
@@ -1091,6 +1155,13 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
         const msg = row.message || {};
         const blocks = Array.isArray(msg.content) ? msg.content : [];
         if (msg.id && !responseId) responseId = msg.id;
+        // The CLI's own request id, carried on the usage object of the row that
+        // closes a streamed response (msg.id lands on the first row instead, so
+        // the two cannot be read from the same row).
+        if (!clientRequestId && msg.usage && typeof msg.usage === 'object' &&
+            typeof msg.usage.request_id === 'string' && msg.usage.request_id) {
+          clientRequestId = msg.usage.request_id;
+        }
         if (row.timestamp) lastAssistantTs = row.timestamp;
         if (row.timestamp && !firstAssistantTs) firstAssistantTs = row.timestamp;
         for (const block of blocks) {
@@ -1139,7 +1210,7 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
     } else if (lastStopReason === 'end_turn' || (i === boundaries.length - 1)) {
       finishReason = 'end_turn';
     } else if (lastStopReason) {
-      finishReason = lastStopReason;
+      finishReason = normalizeFinishReason(lastStopReason);
     } else {
       finishReason = 'stop';
     }
@@ -1156,10 +1227,28 @@ export function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, 
         'gen_ai.request.model': stepModel,
         'gen_ai.response.model': stepModel,
         'gen_ai.response.id': responseId,
-        'gen_ai.response.finish_reasons': [finishReason],
+        ...(finishReason ? { 'gen_ai.response.finish_reasons': [finishReason] } : {}),
         'user.id': userId,
-        'gen_ai.output.messages': [{ role: 'assistant', parts: outputParts, finish_reason: finishReason }],
+        'gen_ai.output.messages': [{
+          role: 'assistant',
+          parts: outputParts,
+          ...(finishReason ? { finish_reason: finishReason } : {}),
+        }],
         'agent.source': 'qoder-transcript-hook',
+        // Raw vendor stop_reason, kept because normalizeFinishReason may map it
+        // onto a different enum value or drop it. Deliberately a single segment
+        // after `agent.`: AGENT_SCOPED_FIELD_RE in entry-builder.ts is
+        // /^agent\.[^.]+\..+$/ and both sls-flusher and jsonl-flusher serialise
+        // with dropAgentScopedFields: true, so an `agent.qoder.stop_reason`
+        // spelling would reach neither sink.
+        'agent.stop_reason': lastStopReason,
+        // The CLI's own request id for this response, taken from the transcript's
+        // usage object. It shares a namespace with a segment record's request_id
+        // (gen_ai.response.id does not: that one is the provider's id), so the
+        // token-enricher joins segments on this field and only falls back to
+        // timestamp proximity when it is absent. Single segment after `agent.`
+        // on purpose, same reason as agent.stop_reason above.
+        'agent.client_request_id': clientRequestId,
         // Accurate per-response timestamp from the transcript's first assistant record
         // (≈ SQLite gmt_create). Used only for token-enricher matching; dropped from
         // SLS/JSONL output as an agent-scoped field. Absent for CLI (no firstAssistantTs).
@@ -1311,16 +1400,17 @@ function assignContentToBoundaries(boundaries, contentEvents) {
 
 /**
  * Split a list of content events into turns.
- * Each real user prompt (type === 'user' and not a tool result) starts a new
- * turn. Tool results and assistant content following a prompt belong to that
- * turn until the next real user prompt.
+ * isMeta rows stay on the preceding prompt, same as tool results.
+ * Slash-command control rows are dropped entirely: they neither start a turn
+ * nor contribute content to one.
  */
-function splitContentEventsIntoTurns(contentEvents) {
+export function splitContentEventsIntoTurns(contentEvents) {
   const turns = [];
   let currentTurn = [];
 
   for (const row of contentEvents) {
-    if (row.type === 'user' && !isToolResult(row)) {
+    if (isControlUserRow(row)) continue;
+    if (isRealUserPrompt(row)) {
       if (currentTurn.length > 0) {
         turns.push(currentTurn);
       }
@@ -1371,6 +1461,179 @@ function extractToolResults(rows) {
   return results;
 }
 
+// The transcript carries Anthropic's native stop_reason values, but
+// gen_ai.response.finish_reasons / output.messages[].finish_reason are the
+// normalized OTel GenAI enum shared with every other agent. Anthropic's
+// documented set is wider (stop_sequence, pause_turn, refusal,
+// model_context_window_exceeded), and validate-trace.mjs raises an *error* for
+// values outside VALID_FINISH_REASONS while only warning when the field is
+// absent — so an unmappable value is dropped rather than passed through. The raw
+// value stays on agent.stop_reason, which survives dropAgentScopedFields.
+// Exported so a test can pin it against the validator's set: this file is copied
+// into ~/.loongsuite-pilot/hooks and runs standalone, so it cannot import it.
+export const VALID_FINISH_REASONS = new Set([
+  'stop',
+  'length',
+  'content_filter',
+  'tool_call',
+  'tool_calls',
+  'error',
+  'end_turn',
+  'max_tokens',
+  // Terminal in otlp-trace-flusher's TERMINAL_FINISH_REASONS and already emitted
+  // by the Codex and WorkBuddy paths, so it belongs in the enum.
+  'cancelled',
+]);
+
+// stop_sequence and refusal both end the turn, so they map onto values that
+// TERMINAL_FINISH_REASONS ({stop, end_turn, cancelled, error}) recognizes;
+// spelling refusal as `content_filter` would be more faithful but would leave
+// that turn's buffer without a Signal A closer.
+const FINISH_REASON_ALIASES = {
+  tool_use: 'tool_call',
+  stop_sequence: 'stop',
+  refusal: 'stop',
+  model_context_window_exceeded: 'length',
+};
+
+// Exported for direct unit coverage: the record path forces `end_turn` on the
+// last boundary, so a fixture cannot exercise the drop branch there.
+export function normalizeFinishReason(reason) {
+  const mapped = FINISH_REASON_ALIASES[reason] ?? reason;
+  // Unknown values are dropped, never coerced to `stop`: a mid-turn value such
+  // as pause_turn would then read as terminal and Signal A would flush the turn
+  // buffer early, trading a validator error for a fragmented trace.
+  return VALID_FINISH_REASONS.has(mapped) ? mapped : undefined;
+}
+
+function isMetaUser(row) {
+  return row?.isMeta === true || row?.isMeta === 'true';
+}
+
+function isImageFileAttachment(row) {
+  return row?.type === 'attachment' && row?.attachment?.type === 'image_file';
+}
+
+function collectTurnImageFileAttachments(rows, userRow) {
+  const out = [];
+  const userUuid = typeof userRow?.uuid === 'string' ? userRow.uuid : '';
+  if (!Array.isArray(rows) || !userUuid) return out;
+
+  for (const row of rows) {
+    if (!isImageFileAttachment(row) || row.parentUuid !== userUuid) continue;
+    const att = row.attachment || {};
+    const filename = typeof att.filename === 'string' ? att.filename.trim() : '';
+    if (filename) out.push(slimImageFileAttachment(att, filename));
+  }
+  return out;
+}
+
+function slimImageFileAttachment(att, filename) {
+  const slim = { type: 'image_file', filename };
+  if (typeof att.displayPath === 'string' && att.displayPath.trim()) {
+    slim.displayPath = att.displayPath.trim();
+  }
+  if (typeof att.mediaType === 'string' && att.mediaType.trim()) {
+    slim.mediaType = att.mediaType.trim();
+  }
+  return slim;
+}
+
+function cliAttachmentFields(agentType, userRow, allParsed) {
+  if (agentType !== 'qoder-cli') return {};
+  const attachments = collectTurnImageFileAttachments(allParsed, userRow);
+  return attachments.length > 0 ? { 'agent.qoder.attachments': attachments } : {};
+}
+
+function isRealUserPrompt(row) {
+  return row?.type === 'user' && !isToolResult(row) && !isMetaUser(row);
+}
+
+// Slash-command plumbing qoder-cli writes as type=user rows. Confirmed shapes,
+// all of them a plain-string content and entrypoint=cli:
+//   [local-command-caveat]                  isMeta
+//   [command-message, command-name]         no isMeta (one row holds both)
+//   [local-command-stdout | ...-stderr]     isMeta
+// None involves a model call. Only the caveat/stdout rows carry isMeta, so the
+// content is what identifies the pair, and no metadata field identifies all three.
+const CONTROL_TAGS = new Set([
+  'local-command-caveat',
+  'command-message',
+  'command-name',
+  'local-command-stdout',
+  'local-command-stderr',
+]);
+
+const CAVEAT_OR_OUTPUT_TAGS = new Set([
+  'local-command-caveat',
+  'local-command-stdout',
+  'local-command-stderr',
+]);
+
+function isEnvelopeSpace(ch) {
+  return ch === ' ' || ch === '\n' || ch === '\r' || ch === '\t';
+}
+
+/**
+ * Return the tag sequence `text` consists of, or null if it holds anything else.
+ *
+ * Deliberately a single forward scan rather than a regex: a pattern that repeats
+ * a lazily-matched envelope is ambiguous about where each envelope ends, and
+ * backtracks exponentially on input that nearly matches. The cursor here only
+ * ever moves forward, so cost is linear in the length of the text and a hostile
+ * prompt cannot stall the Stop hook.
+ */
+function scanControlEnvelopes(text) {
+  const tags = [];
+  let i = 0;
+
+  while (i < text.length) {
+    while (i < text.length && isEnvelopeSpace(text[i])) i++;
+    if (i >= text.length) break;
+    if (text[i] !== '<') return null;
+
+    const openEnd = text.indexOf('>', i + 1);
+    if (openEnd === -1) return null;
+    const tag = text.slice(i + 1, openEnd);
+    if (!CONTROL_TAGS.has(tag)) return null;
+
+    const closeAt = text.indexOf(`</${tag}>`, openEnd + 1);
+    if (closeAt === -1) return null;
+
+    tags.push(tag);
+    i = closeAt + tag.length + 3;
+  }
+
+  return tags.length > 0 ? tags : null;
+}
+
+function isControlEnvelopeSequence(tags, row) {
+  if (tags.length === 1) {
+    // A lone <command-name> is something a user can plausibly type or paste, so
+    // the banner and output rows are only recognized together with their isMeta.
+    return CAVEAT_OR_OUTPUT_TAGS.has(tags[0]) && isMetaUser(row);
+  }
+  if (tags.length === 2) {
+    return tags[0] === 'command-message' && tags[1] === 'command-name';
+  }
+  return false;
+}
+
+function isControlUserRow(row) {
+  // A promptId means the CLI itself booked the row as a submitted prompt, so it
+  // can never be plumbing. Most rows carry no promptId, so this only
+  // short-circuits; the envelope shape is what decides.
+  if (row?.type !== 'user' || isToolResult(row) || row.promptId) return false;
+  // Only qoder-cli emits this plumbing, and only ever as a plain string. A
+  // content-block array is a real message, whatever its first block looks like.
+  if (row.entrypoint !== 'cli') return false;
+  const content = row.message?.content;
+  if (typeof content !== 'string') return false;
+
+  const tags = scanControlEnvelopes(content);
+  return tags !== null && isControlEnvelopeSequence(tags, row);
+}
+
 function extractUserText(row) {
   const content = row.message?.content;
   if (typeof content === 'string') return content;
@@ -1381,6 +1644,20 @@ function extractUserText(row) {
     }
   }
   return '';
+}
+
+function buildUserMessageParts(userText, contentEvents, agentType) {
+  const parts = [{ type: 'text', content: userText }];
+  if (agentType !== 'qoder-cli' || !Array.isArray(contentEvents)) return parts;
+  const seen = new Set([userText]);
+  for (const row of contentEvents) {
+    if (row.type !== 'user' || isToolResult(row)) continue;
+    const text = extractUserText(row);
+    if (!text || seen.has(text)) continue;
+    parts.push({ type: 'text', content: text });
+    seen.add(text);
+  }
+  return parts;
 }
 
 function inferVariant(row, sourceAgentId) {
@@ -1398,14 +1675,16 @@ function resolveUserId(row, runtimeConfig) {
   return '';
 }
 
-// --- Legacy fallback (no progress events) ------------------------------------
-// Used when transcript has no progress events AND no assistant blocks detected.
+// --- Legacy fallback (no LLM boundaries) -------------------------------------
+// Used when `buildLlmBoundaries` yields nothing, i.e. the turn has no assistant
+// block. Progress events alone do not prevent this path.
 // Limitations: no llm.request synthesis (LLM spans will be 0ms orphan responses),
 // no multi-part merging. QoderTraceInput's token enricher provides tokens but timing is approximate.
 
-function buildLegacyEvents(contentEvents, turnId, sessionId, agentId, runtimeConfig, existingRecords, observedTs) {
-  // When no progress events are available, use the old per-line normalization
-  for (const row of contentEvents) {
+function buildLegacyEvents(residualEvents, turnId, sessionId, agentId, runtimeConfig, existingRecords, observedTs) {
+  // Per-line normalization for the rows the caller did not emit itself. The
+  // turn's user prompt already arrives via `existingRecords`.
+  for (const row of residualEvents) {
     const record = buildQoderHookRecord(row, { agentId, runtimeConfig, turnId });
     if (record) existingRecords.push(record);
   }

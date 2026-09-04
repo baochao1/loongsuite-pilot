@@ -31,6 +31,7 @@ import {
   parseMaybeJson,
   inferProviderName,
 } from '../agent-event-normalizer.mjs';
+import { cursorWorkspaceFields, resolveWorkspacePath } from './workspace-context.mjs';
 
 // ─── Public API ───
 
@@ -50,6 +51,7 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
 
   const runtimeConfig = options.runtimeConfig || {};
   const stopConversationId = options.stopConversationId;
+  const variant = options.variant || 'cursor';
 
   const promptEvent = stopConversationId
     ? journalEvents.find(e => e.hook_event === 'beforeSubmitPrompt' && e.conversation_id === stopConversationId)
@@ -65,6 +67,7 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
     .filter(e => e.conversation_id === parentConvId)
     .filter(e => e.hook_event !== 'sessionStart')
     .sort((a, b) => tsMs(a) - tsMs(b));
+  const workspacePath = resolveWorkspacePath(parentEvents);
 
   // T5: Resolve model from journal events (afterAgentThought/Response carry real model)
   const model = parentEvents.find(e =>
@@ -76,9 +79,10 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
     trace_id: traceId,
     'gen_ai.session.id': parentConvId,
     'gen_ai.turn.id': turnId,
-    'gen_ai.agent.type': 'cursor',
+    'gen_ai.agent.type': variant,
     'gen_ai.agent.id': parentConvId,
     'user.id': userId,
+    ...cursorWorkspaceFields(variant, workspacePath),
   };
 
   const records = [];
@@ -140,20 +144,31 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
     // llm.request.model from step events
     const stepModel = step.thoughtEvent?.model || step.responseEvent?.model || model;
 
+    const inputMessageDelta = [];
+    if (i === 0 && userText) {
+      inputMessageDelta.push({
+        role: 'user',
+        parts: [{ type: 'text', content: userText }],
+      });
+    }
     if (i > 0 && prevToolResults.length > 0) {
       if (previousAssistantToolMessage) {
-        cumulativeInputMessages.push(cloneMessage(previousAssistantToolMessage));
+        const assistantMessage = cloneMessage(previousAssistantToolMessage);
+        inputMessageDelta.push(assistantMessage);
+        cumulativeInputMessages.push(cloneMessage(assistantMessage));
       }
       // NOTE: tool_output from journal postToolUse may contain GB18030-garbled text.
       // Omit response content to avoid garbled data in output; structure is preserved.
-      cumulativeInputMessages.push({
+      const toolMessage = {
         role: 'tool',
         parts: prevToolResults.map(tr => ({
           type: 'tool_call_response',
           id: tr.tool_use_id || null,
           response: '',
         })),
-      });
+      };
+      inputMessageDelta.push(toolMessage);
+      cumulativeInputMessages.push(cloneMessage(toolMessage));
     }
     const inputMessages = cumulativeInputMessages.map(cloneMessage);
 
@@ -169,6 +184,9 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
       'gen_ai.response.id': responseId,
       'gen_ai.provider.name': inferProvider(stepModel),
       'gen_ai.request.model': stepModel,
+      'gen_ai.input.messages_delta': inputMessageDelta.length > 0
+        ? inputMessageDelta.map(cloneMessage)
+        : undefined,
       'gen_ai.input.messages': inputMessages.length > 0 ? inputMessages : undefined,
       'agent.cursor.hook_event_name': reqSource.hook_event,
       'agent.cursor.llm_request_time_source': i === 0

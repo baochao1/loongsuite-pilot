@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   acquireRetryLock,
   assessStableEofCandidate,
@@ -15,6 +16,7 @@ import {
   retryLockPath,
   readTranscriptSnapshot,
   selectTurnSegmentsForCollection,
+  splitContentEventsIntoTurns,
   tryAcquireRetryLock,
 } from '../../../assets/hooks/qoder-hook-processor.mjs';
 
@@ -574,6 +576,97 @@ describe('findTriggeredTurnWindow', () => {
   });
 });
 
+// --- B3 P0 fix: stop detection must accept assistant message.stop_reason ---
+// Fixtures live in tests/fixtures/qoder/transcript-*.jsonl. Real-shape rows
+// derived from tester B3 diagnosis (comment 959f121d): qoder transcripts carry
+// `message.stop_reason` on the final assistant row of a turn; retry path used
+// to only recognise `progress Stop` rows and silently dropped such turns.
+describe('findTriggeredTurnWindow stop source variants (B3 P0)', () => {
+  const fixturesDir = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../fixtures/qoder',
+  );
+  const snapshot = name => readTranscriptSnapshot(path.join(fixturesDir, name));
+
+  it('case 1: detects stop via Stop progress row (regression, old path not degraded)', () => {
+    const result = findTriggeredTurnWindow(snapshot('transcript-stop-progress-only.jsonl'), 4);
+    expect(result).toEqual({
+      status: 'complete',
+      reason: 'last-prompt',
+      startLine: 1,
+      stopLine: 4,
+      endLine: 6,
+    });
+  });
+
+  it('case 2: detects stop via assistant message.stop_reason when no Stop progress row', () => {
+    const result = findTriggeredTurnWindow(snapshot('transcript-stop-reason-only.jsonl'), 3);
+    expect(result).toEqual({
+      status: 'complete',
+      reason: 'last-prompt',
+      startLine: 1,
+      stopLine: 3,
+      endLine: 5,
+    });
+  });
+
+  it('case 3: prefers the Stop progress row when both signals are present', () => {
+    const result = findTriggeredTurnWindow(snapshot('transcript-both-stops.jsonl'), 5);
+    // Row 3 is an assistant `tool_use`, i.e. mid-turn: the model resumes after
+    // the tool result, so it is not a boundary. The scan remembers nothing and
+    // reaches the Stop progress row at 4, which is the authoritative boundary.
+    expect(result).toEqual({
+      status: 'complete',
+      reason: 'last-prompt',
+      startLine: 1,
+      stopLine: 4,
+      endLine: 6,
+    });
+  });
+
+  it('case 4: skips mid-turn tool_use and stops at the terminal assistant row', () => {
+    // tool_use -> tool_result -> end_turn, the ReAct shape that dominates real
+    // transcripts. Accepting the first stop_reason would put stopLine at 3 while
+    // the turn actually ends at 5.
+    const result = findTriggeredTurnWindow(snapshot('transcript-react-tool-cycle.jsonl'), 6);
+    expect(result).toEqual({
+      status: 'complete',
+      reason: 'last-prompt',
+      startLine: 1,
+      stopLine: 5,
+      endLine: 7,
+    });
+  });
+
+  it('case 5: treats stop_sequence as terminal', () => {
+    // stop_sequence is a genuine turn end and is sometimes a turn's only
+    // terminal row on real transcripts, so leaving it out of the terminal set
+    // would downgrade those turns from "collected early" to "never collected".
+    const result = findTriggeredTurnWindow(snapshot('transcript-stop-sequence.jsonl'), 4);
+    expect(result).toEqual({
+      status: 'complete',
+      reason: 'last-prompt',
+      startLine: 1,
+      stopLine: 3,
+      endLine: 5,
+    });
+  });
+
+  it('case 6: keeps waiting when the turn only carries non-terminal stop reasons', () => {
+    // tool_use plus pause_turn: the assistant resumes in both cases, so there is
+    // no boundary yet. Committing here would emit a prefix of the turn once
+    // assessStableEofCandidate saw the same bytes twice.
+    const result = findTriggeredTurnWindow(snapshot('transcript-pause-turn.jsonl'), 6);
+    expect(result).toEqual({
+      status: 'waiting',
+      reason: 'stop-not-found',
+      startLine: null,
+      stopLine: null,
+      endLine: null,
+    });
+  });
+});
+
 describe('buildEventsFromBoundaries tool result matching', () => {
   it('matches parallel tool results by tool_use_id instead of return order', () => {
     const makeToolResult = (timestamp, id, content, isError = false) => ({
@@ -646,5 +739,234 @@ describe('buildEventsFromBoundaries tool result matching', () => {
       1001,
       1000,
     ]);
+  });
+});
+
+describe('buildEventsFromBoundaries CLI image source parts', () => {
+  it('keeps the primary prompt and appends meta Image:source text for qoder-cli', () => {
+    const clip = '/tmp/clip.png.png';
+    const rows = [
+      {
+        type: 'user',
+        timestamp: '2026-08-12T09:17:48.318Z',
+        entrypoint: 'cli',
+        promptId: 'p1',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text: '[Image #0]这个图像在讲什么？' },
+            { type: 'image', source: { type: 'url', url: 'https://example/x.png' } },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: '2026-08-12T09:17:48.529Z',
+        isMeta: true,
+        entrypoint: 'cli',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: `[Image: source: ${clip}]` }],
+        },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2026-08-12T09:17:55.407Z',
+        message: {
+          role: 'assistant',
+          model: 'auto',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'ok' }],
+        },
+      },
+    ];
+    const progress = [
+      { hookEvent: 'UserPromptSubmit', ts: '2026-08-12T09:17:48.000Z' },
+      { hookEvent: 'Stop', ts: '2026-08-12T09:17:56.000Z' },
+    ];
+    const boundaries = buildLlmBoundaries(progress, rows);
+    const records = buildEventsFromBoundaries(
+      boundaries, rows, rows, 'turn-cli', 'session-cli', 'qoder', {}, '/Users/me/workspace',
+    );
+    expect(records.every(r => r['gen_ai.agent.type'] === 'qoder-cli')).toBe(true);
+    const request = records.find(r => r['event.name'] === 'llm.request');
+    const parts = request['gen_ai.input.messages_delta'][0].parts;
+    expect(parts[0]).toEqual({ type: 'text', content: '[Image #0]这个图像在讲什么？' });
+    expect(parts.some(p => p.type === 'text' && p.content === `[Image: source: ${clip}]`)).toBe(true);
+  });
+
+  it('does not append Image:source parts for IDE turns', () => {
+    const rows = [
+      {
+        type: 'user',
+        timestamp: '2026-08-12T09:17:48.318Z',
+        message: { role: 'user', content: '解释这张图片' },
+      },
+      {
+        type: 'user',
+        timestamp: '2026-08-12T09:17:48.529Z',
+        isMeta: true,
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: '[Image: source: /tmp/clip.png]' }],
+        },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2026-08-12T09:17:55.407Z',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+        },
+      },
+    ];
+    const progress = [
+      { hookEvent: 'UserPromptSubmit', ts: '2026-08-12T09:17:48.000Z' },
+      { hookEvent: 'Stop', ts: '2026-08-12T09:17:56.000Z' },
+    ];
+    const boundaries = buildLlmBoundaries(progress, rows);
+    const records = buildEventsFromBoundaries(
+      boundaries, rows, rows, 'turn-ide', 'session-ide', 'qoder', {}, '/Users/me/workspace',
+    );
+    expect(records[0]['gen_ai.agent.type']).toBe('qoder');
+    const parts = records.find(r => r['event.name'] === 'llm.request')['gen_ai.input.messages_delta'][0].parts;
+    expect(parts).toEqual([{ type: 'text', content: '解释这张图片' }]);
+  });
+
+  it('does not start a new turn on isMeta Image:source rows', () => {
+    const prompt = {
+      type: 'user',
+      timestamp: '2026-08-12T09:17:48.318Z',
+      entrypoint: 'cli',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '[Image #0]这个图像在讲什么？' },
+          { type: 'image', source: { type: 'url', url: 'https://example/x.png' } },
+        ],
+      },
+    };
+    const meta = {
+      type: 'user',
+      timestamp: '2026-08-12T09:17:48.529Z',
+      isMeta: true,
+      entrypoint: 'cli',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: '[Image: source: /tmp/clip.png.png]' }],
+      },
+    };
+    const assistant = {
+      type: 'assistant',
+      timestamp: '2026-08-12T09:17:55.407Z',
+      message: {
+        role: 'assistant',
+        model: 'auto',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'ok' }],
+      },
+    };
+    const turns = splitContentEventsIntoTurns([prompt, meta, assistant]);
+    expect(turns).toHaveLength(1);
+    expect(turns[0][0]).toBe(prompt);
+    expect(turns[0]).toContain(meta);
+
+    const progress = [
+      { hookEvent: 'UserPromptSubmit', ts: '2026-08-12T09:17:48.000Z' },
+      { hookEvent: 'Stop', ts: '2026-08-12T09:17:56.000Z' },
+    ];
+    const records = buildEventsFromBoundaries(
+      buildLlmBoundaries(progress, [meta, prompt, assistant]),
+      [meta, prompt, assistant],
+      [meta, prompt, assistant],
+      'turn-meta-first',
+      'session-cli',
+      'qoder',
+      {},
+      '/tmp',
+    );
+    const parts = records.find(r => r['event.name'] === 'llm.request')['gen_ai.input.messages_delta'][0].parts;
+    expect(parts[0]).toEqual({ type: 'text', content: '[Image #0]这个图像在讲什么？' });
+    expect(parts.some(p => p.type === 'text' && p.content.includes('[Image: source:'))).toBe(true);
+  });
+
+  it('reads image_file.filename from the attachment row, not from user/assistant stream', () => {
+    const filename = '/Users/me/workspace/loongsuite-pilot/picture/pipeline.jpg';
+    const otherFilename = '/Users/me/workspace/other.jpg';
+    const user = {
+      type: 'user',
+      uuid: 'user-1',
+      timestamp: '2026-08-25T04:56:24.622Z',
+      entrypoint: 'cli',
+      promptId: 'p-at',
+      message: { role: 'user', content: '@picture/pipeline.jpg 用一句话说明这张图' },
+    };
+    const attachment = {
+      type: 'attachment',
+      uuid: 'att-1',
+      parentUuid: 'user-1',
+      timestamp: '2026-08-25T04:56:24.622Z',
+      entrypoint: 'cli',
+      attachment: {
+        type: 'image_file',
+        filename,
+        displayPath: 'picture/pipeline.jpg',
+        url: 'https://example.invalid/oss.jpg',
+      },
+    };
+    const otherTurnAttachment = {
+      type: 'attachment',
+      uuid: 'att-2',
+      parentUuid: 'user-other',
+      timestamp: '2026-08-25T04:56:24.622Z',
+      attachment: { type: 'image_file', filename: otherFilename },
+    };
+    const orphanAttachment = {
+      type: 'attachment',
+      uuid: 'att-orphan',
+      timestamp: '2026-08-25T04:56:24.622Z',
+      attachment: { type: 'image_file', filename: '/tmp/orphan.jpg' },
+    };
+    const skillListing = {
+      type: 'attachment',
+      timestamp: '2026-08-25T04:56:24.623Z',
+      attachment: { type: 'skill_listing', content: 'ignore me' },
+    };
+    const assistant = {
+      type: 'assistant',
+      timestamp: '2026-08-25T04:56:27.515Z',
+      message: {
+        role: 'assistant',
+        model: 'auto',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'ok' }],
+      },
+    };
+    const contentEvents = [user, assistant];
+    const allParsed = [user, attachment, otherTurnAttachment, orphanAttachment, skillListing, assistant];
+    const progress = [
+      { hookEvent: 'UserPromptSubmit', ts: '2026-08-25T04:56:24.000Z' },
+      { hookEvent: 'Stop', ts: '2026-08-25T04:56:28.000Z' },
+    ];
+    const records = buildEventsFromBoundaries(
+      buildLlmBoundaries(progress, contentEvents),
+      contentEvents,
+      allParsed,
+      'turn-filename',
+      'session-filename',
+      'qoder',
+      {},
+      '/Users/me/other',
+    );
+    const request = records.find(r => r['event.name'] === 'llm.request');
+    const parts = request['gen_ai.input.messages_delta'][0].parts;
+    expect(parts).toEqual([{ type: 'text', content: '@picture/pipeline.jpg 用一句话说明这张图' }]);
+    expect(request['agent.qoder.attachments']).toEqual([
+      { type: 'image_file', filename, displayPath: 'picture/pipeline.jpg' },
+    ]);
+    expect(JSON.stringify(request['agent.qoder.attachments'])).not.toContain(otherFilename);
+    expect(JSON.stringify(request['agent.qoder.attachments'])).not.toContain('/tmp/orphan.jpg');
+    expect(JSON.stringify(request)).not.toContain('ignore me');
+    expect(JSON.stringify(request)).not.toContain('example.invalid');
   });
 });
