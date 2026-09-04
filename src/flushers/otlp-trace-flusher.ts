@@ -20,6 +20,7 @@ import type { AgentActivityEntry, OtlpTraceFlusherConfig } from '../types/index.
 import { BaseFlusher } from './base-flusher.js';
 import { normalizeAgentType } from '../utils/agent-type-normalize.js';
 import { resolveAgentSystem } from '../normalization/agent-system-map.js';
+import { LOCAL_IP } from '../utils/network-utils.js';
 import {
   DEFAULT_GIT_PASSTHROUGH_KEYS,
   isReservedKey,
@@ -109,6 +110,7 @@ const RESERVED_RESOURCE_KEYS = new Set([
   'service.instance.id',
   'service.namespace',
   'host.name',
+  'host.ip',
   'gen_ai.agent.type',
   'gen_ai.agent.system',
   'gen_ai.framework',
@@ -1197,6 +1199,10 @@ export class OtlpTraceFlusher extends BaseFlusher {
       'service.instance.id': this.instanceId,
       'service.namespace': 'loongsuite-pilot',
       'host.name': os.hostname(),
+      // Machine identity per OTel Resource SemConv: host.name is the hostname,
+      // host.ip is the resolved local IPv4 (fixed at startup). Both are reserved
+      // so user/projected resourceAttributes cannot clobber the reported source.
+      'host.ip': LOCAL_IP,
       'gen_ai.agent.type': agentType,
       'gen_ai.agent.system': resourceIdentity.system,
       // ARMS GenAI semconv recommends gen_ai.framework on every span. The

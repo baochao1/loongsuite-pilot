@@ -16,6 +16,7 @@ import { OtlpTraceFlusher } from '../../../../src/flushers/otlp-trace-flusher.js
 import { convertEventLogToTrace } from '@loongsuite/otel-util-genai';
 import type { AgentActivityEntry } from '../../../../src/types/index.js';
 import { GlobalAttributesProvider } from '../../../../src/normalization/global-attributes.js';
+import { LOCAL_IP } from '../../../../src/utils/network-utils.js';
 
 function makeConfig() {
   return {
@@ -111,6 +112,20 @@ describe('OtlpTraceFlusher - conversion', () => {
       'agentteams.worker.name': 'local-worker',
       'agentteams.instance.id': 'example-instance',
     });
+  });
+
+  it('sets machine identity host.ip/host.name on the resource', () => {
+    const flusher = new OtlpTraceFlusher(makeConfig()) as any;
+    const resource = flusher.buildResource('claude-code', 'test-pilot');
+    expect(resource.attributes['host.name']).toBeTypeOf('string');
+    expect(resource.attributes['host.ip']).toBe(LOCAL_IP);
+    // reserved machine-identity keys cannot be overridden by user config
+    const override = (flusher as any).buildResource('claude-code', 'test-pilot', {
+      'host.ip': '203.0.113.9',
+      'host.name': 'evil-host',
+    });
+    expect(override.attributes['host.ip']).toBe(LOCAL_IP);
+    expect(override.attributes['host.name']).toBeTypeOf('string');
   });
 
   it('uses an explicit PI system and framework for a registered custom Agent resource', () => {
