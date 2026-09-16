@@ -357,6 +357,7 @@ export class Orchestrator extends EventEmitter {
       userId: this.config.userId,
       canaryPolicy: this.config.autoUpdate?.canaryPolicy ?? '',
       getSnapshot: () => this.buildDataflowSnapshot(),
+      getTraceRuntimeSnapshot: () => this.flusher?.getTraceRuntimeSnapshot() ?? [],
       alarmManager: this.alarmManager,
       agentsConfig: this.config.agents,
       slsEndpoints: this.config.flushers.sls?.endpoints ?? [],
@@ -535,7 +536,7 @@ export class Orchestrator extends EventEmitter {
         id: entryId,
         type: 'deploy-detection',
         watchPaths,
-        isAvailable: () => detectAgent(def.detection),
+        isAvailable: () => this.deploymentManager.isAgentDetected(def),
         enabled: () => this.isAgentGatedEnabled(def.id),
         start: async () => {
           logger.info('new agent discovered, deploying', { agentId: def.id });
@@ -641,7 +642,7 @@ export class Orchestrator extends EventEmitter {
             && !(await fileExists(pluginPath))
             && !(await directoryExists(pluginPath))
           ) return false;
-          return detectAgent(def.detection);
+          return this.deploymentManager.isAgentDetected(def);
         },
         check: async () => {
           // Healthy == spec still present in the agent's config file.
@@ -649,6 +650,9 @@ export class Orchestrator extends EventEmitter {
         },
         repair: async () => {
           const result = await this.deploymentManager.deploySingle(def);
+          if (result.skipped && result.reason === 'not-detected') {
+            throw new Error(`Agent disappeared before plugin repair for ${def.id}`);
+          }
           if (!result.success) {
             throw new Error(result.error ?? `re-inject failed for ${def.id}`);
           }
@@ -988,6 +992,7 @@ export class Orchestrator extends EventEmitter {
     const qoderCnTraceInput = new QoderCnTraceInput({
       stateStore: this.stateStore,
       logDir: qoderCnLogDir,
+      pollIntervalMs: listenerCfg['qoder-cn-trace']?.pollInterval,
     });
     this.inputManager.registerInput(qoderCnTraceInput);
     entries.push(
@@ -1144,15 +1149,12 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- QwenWorkCN Trace: independent hook + segments + token intercept merge ---
     const qwenWorkCNLogDir = path.join(this.dataDir, 'logs', 'qwen-work-cn', 'history');
     const qwenWorkCNSegmentsRoot = resolveHome('~/.qwenworkcn/logs/sessions');
-    const qwenWorkCNInterceptFile = path.join(this.dataDir, 'logs', 'qwenworkcn-intercept.jsonl');
     const qwenWorkCNTraceInput = new QwenWorkCNTraceInput({
       stateStore: this.stateStore,
       logDir: qwenWorkCNLogDir,
       segmentsRoot: qwenWorkCNSegmentsRoot,
-      interceptFile: qwenWorkCNInterceptFile,
     });
     this.inputManager.registerInput(qwenWorkCNTraceInput);
     const qwenWorkCNTraceEnabled = () =>
@@ -1166,7 +1168,6 @@ export class Orchestrator extends EventEmitter {
         watchPaths: QwenWorkCNTraceInput.getWatchPaths({
           logDir: qwenWorkCNLogDir,
           segmentsRoot: qwenWorkCNSegmentsRoot,
-          interceptFile: qwenWorkCNInterceptFile,
         }),
         isAvailable: QwenWorkCNTraceInput.checkAvailability,
         enabled: qwenWorkCNTraceEnabled,

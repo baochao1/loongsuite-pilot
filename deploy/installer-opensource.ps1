@@ -921,7 +921,7 @@ function Probe-Agents {
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
     if (Test-Path $probeScript) {
         try {
-            $raw = & $script:NODE_BIN $probeScript 2>$null
+            $raw = & $script:NODE_BIN $probeScript --installer --config-path (Join-Path $DataDir 'config.json') 2>$null
             if ($raw) {
                 $script:PROBE_RESULT = if ($raw -is [array]) { $raw -join "" } else { $raw }
             }
@@ -941,6 +941,7 @@ function Probe-Agents {
 # Agent selection
 # ============================================================
 $script:SELECTED_AGENTS = $Agents
+$script:AGENT_SELECTION_EXPLICIT = if ($Agents) { '1' } else { '0' }
 
 function Select-Agents {
     if ($script:SELECTED_AGENTS) {
@@ -979,8 +980,8 @@ const defaults = [];
 for (let i = 0; i < r.length; i++) {
   const a = r[i];
   const status = lang === 'zh'
-    ? (a.detected ? '已检测到: ' + a.reason : '未检测到')
-    : (a.detected ? 'detected: ' + a.reason : 'not detected');
+    ? (a.detected ? '已检测到: ' + a.reason : '未检测到' + (a.reason ? ': ' + a.reason : ''))
+    : (a.detected ? 'detected: ' + a.reason : 'not detected' + (a.reason ? ': ' + a.reason : ''));
   console.log('    [' + (i+1) + '] ' + a.displayName.padEnd(16) + '(' + status + ')');
   if (a.detected) defaults.push(i+1);
 }
@@ -998,6 +999,7 @@ if (lang === 'zh') {
     $rawSelection = Read-Host "    >"
     $selectInput = if ($null -eq $rawSelection) { "" } else { $rawSelection.Trim() }
     $selectInput = $selectInput -replace '[，、；]', ','
+    if ($selectInput) { $script:AGENT_SELECTION_EXPLICIT = '1' }
 
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
     $script:SELECTED_AGENTS = $script:PROBE_RESULT | & $script:NODE_BIN -e @'
@@ -1498,6 +1500,7 @@ function Write-Config {
         langfuseSecretKey = "$($script:LangfuseSecretKey)"
         langfuseServiceName = "$($script:LangfuseServiceName)"
         selectedAgents    = "$($script:SELECTED_AGENTS)"
+        agentSelectionExplicit = "$($script:AGENT_SELECTION_EXPLICIT)"
         maskMode          = "$MaskMode"
         maskTypes         = "$MaskTypes"
         probeResult       = "$($script:PROBE_RESULT)"
@@ -1595,11 +1598,25 @@ if (opts.maskMode) {
 }
 if (opts.selectedAgents) {
   config.agents = config.agents || {};
+  const previousOpenclaw = config.agents.openclaw;
   const selected = opts.selectedAgents.split(',').map(s => s.trim()).filter(Boolean);
   const allAgents = JSON.parse(opts.probeResult || '[]');
   for (const agent of allAgents) {
     config.agents[agent.id] = config.agents[agent.id] || {};
+    // A transient discovery miss is not consent to uninstall a live plugin.
+    if (agent.id === 'openclaw' && !agent.detected && opts.agentSelectionExplicit !== '1'
+        && previousOpenclaw !== undefined) {
+      console.log('OpenClaw: detection unavailable; preserving previous enabled state and entry');
+      continue;
+    }
     config.agents[agent.id].enabled = selected.includes(agent.id);
+    if (agent.id === 'openclaw' && agent.detected && selected.includes(agent.id) && agent.openclawCliPath) {
+      const previousEntry = config.agents[agent.id].cliPath;
+      if (typeof previousEntry === 'string' && previousEntry !== agent.openclawCliPath) {
+        console.log('OpenClaw: updating launch entry ' + JSON.stringify(previousEntry) + ' -> ' + JSON.stringify(agent.openclawCliPath));
+      }
+      config.agents[agent.id].cliPath = agent.openclawCliPath;
+    }
   }
 }
 
@@ -1612,11 +1629,7 @@ fs.writeFileSync(opts.configPath, JSON.stringify(config, null, 2) + '\n');
     Write-Host ""
 }
 
-# ============================================================
-# QoderWork-family runtime wrapper: persist the dedicated User-level overrides
-# in HKCU\Environment. reg.exe is the CLM-safe source of truth; the guarded
-# .NET call broadcasts WM_SETTINGCHANGE so Explorer-spawned apps see updates.
-# ============================================================
+# reg.exe removes overrides under CLM; the guarded .NET call notifies Explorer.
 function Get-PilotRuntimeOverride {
     param([string]$Name)
     $prevEAP = $ErrorActionPreference
@@ -1636,37 +1649,6 @@ function Get-PilotRuntimeOverride {
     return ""
 }
 
-function Test-AgentCollectionEnabled {
-    param([string]$AgentId)
-    $configFile = Join-Path $DataDir "config.json"
-    if (-not (Test-Path $configFile)) { return $false }
-
-    $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
-    $enabled = & $script:NODE_BIN -e @'
-try {
-  const config = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8').replace(/^\uFEFF/, ''));
-  const agentId = process.argv[2];
-  process.stdout.write(config?.agents?.[agentId]?.enabled === false ? 'false' : 'true');
-} catch {
-  process.stdout.write('false');
-}
-'@ $configFile $AgentId 2>$null
-    $ErrorActionPreference = $prevEAP
-    return "$enabled".Trim() -eq "true"
-}
-
-function Set-PilotRuntimeOverride {
-    param([string]$Name, [string]$Value)
-    reg.exe add "HKCU\Environment" /v $Name /t REG_SZ /d "$Value" /f | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Failed to set $Name" }
-    try {
-        [Environment]::SetEnvironmentVariable($Name, $Value, 'User')
-        return $true
-    } catch {
-        return $false
-    }
-}
-
 function Remove-PilotRuntimeOverride {
     param([string]$Name)
     reg.exe delete "HKCU\Environment" /v $Name /f 2>$null | Out-Null
@@ -1679,68 +1661,30 @@ function Remove-PilotRuntimeOverride {
     }
 }
 
-function Sync-PilotRuntimeOverride {
-    param(
-        [string]$Name,
-        [bool]$ShouldEnable,
-        [string]$WrapperPath,
-        [string]$ProductName
-    )
+function Retire-PilotRuntimeOverride {
+    param([string]$Name, [string]$WrapperPath)
     $current = Get-PilotRuntimeOverride -Name $Name
-    if (-not (Test-Path $WrapperPath)) {
-        $script:RUNTIME_WRAPPER_MISSING = $true
-        if ($current -and $current -ieq $WrapperPath) {
-            $broadcasted = Remove-PilotRuntimeOverride -Name $Name
-            if (-not $broadcasted) { $script:RUNTIME_ENV_BROADCAST_FAILED = $true }
-            Msg "    ⚠️  wrapper 缺失，已清理 $Name" "    ⚠️  Wrapper missing; cleaned $Name"
-        } else {
-            Msg "    ⚠️  wrapper 缺失，未设置 $Name" "    ⚠️  Wrapper missing; did not set $Name"
-        }
-        return
-    }
-
-    if ($ShouldEnable) {
-        if ($current -ine $WrapperPath) {
-            $broadcasted = Set-PilotRuntimeOverride -Name $Name -Value $WrapperPath
-            if (-not $broadcasted) { $script:RUNTIME_ENV_BROADCAST_FAILED = $true }
-            Msg "    ✅ $Name ($ProductName)" "    ✅ $Name ($ProductName)"
-        }
-    } elseif ($current -and $current -ieq $WrapperPath) {
+    if (-not $current) { return }
+    # Pilot-owned only: a third-party override must survive untouched.
+    if (($current -ieq $WrapperPath) -or ($current -like '*loongsuite-pilot*')) {
         $broadcasted = Remove-PilotRuntimeOverride -Name $Name
         if (-not $broadcasted) { $script:RUNTIME_ENV_BROADCAST_FAILED = $true }
-        Msg "    ✅ 已清理 $Name" "    ✅ Cleaned $Name"
+        Msg "    ✅ 已退役 $Name" "    ✅ Retired $Name"
     }
 }
 
-function Inject-QoderworkRuntimeWrapper {
+function Retire-QoderworkRuntimeOverrides {
     $wrapperPath = Join-Path $DataDir "hooks\qoderwork-runtime-wrapper.mjs"
-    $localAppData = $env:LOCALAPPDATA
-    if (-not $localAppData) { $localAppData = Join-Path $env:USERPROFILE "AppData\Local" }
-
-    $qwenInstalled = Test-Path (Join-Path $localAppData "Programs\QwenWorkCN")
-    $qoderInstalled = Test-Path (Join-Path $localAppData "Programs\QoderWork")
-    $qoderCNInstalled = (Test-Path (Join-Path $localAppData "Programs\QoderWorkCN")) -or `
-                        (Test-Path (Join-Path $localAppData "Programs\QoderWork CN"))
-    $qwenShouldEnable = $qwenInstalled -and (Test-AgentCollectionEnabled -AgentId 'qwen-work-cn')
-    $qoderShouldEnable = ($qoderInstalled -and (Test-AgentCollectionEnabled -AgentId 'qoder-work')) -or `
-                         ($qoderCNInstalled -and (Test-AgentCollectionEnabled -AgentId 'qoder-work-cn'))
-
     $script:RUNTIME_ENV_BROADCAST_FAILED = $false
-    $script:RUNTIME_WRAPPER_MISSING = $false
-    Sync-PilotRuntimeOverride -Name 'QW_QODER_WORKER_RUNTIME_PATH' `
-        -ShouldEnable $qwenShouldEnable -WrapperPath $wrapperPath -ProductName 'QwenWorkCN'
-    Sync-PilotRuntimeOverride -Name 'QODER_WORKER_RUNTIME_PATH' `
-        -ShouldEnable $qoderShouldEnable -WrapperPath $wrapperPath -ProductName 'QoderWork'
+    Retire-PilotRuntimeOverride -Name 'QW_QODER_WORKER_RUNTIME_PATH' -WrapperPath $wrapperPath
+    Retire-PilotRuntimeOverride -Name 'QODER_WORKER_RUNTIME_PATH' -WrapperPath $wrapperPath
 
-    if ($script:RUNTIME_WRAPPER_MISSING) {
-        Msg "    ⚠️  runtime wrapper 未完整部署，已跳过 token 拦截以避免影响应用" `
-            "    ⚠️  Runtime wrapper is missing; token interception was skipped to protect the apps"
-    } elseif ($script:RUNTIME_ENV_BROADCAST_FAILED) {
-        Msg "    ⚠️  环境变量已持久化，但无法通知 Explorer；请注销并重新登录 Windows" `
-            "    ⚠️  Environment persisted but Explorer could not be notified; sign out and back in"
+    if ($script:RUNTIME_ENV_BROADCAST_FAILED) {
+        Msg "    环境变量已清理，但无法通知 Explorer；请注销并重新登录 Windows" `
+            "    Environment overrides removed but Explorer could not be notified; sign out and back in"
     } else {
-        Msg "    ⚠️  请完全退出并重新打开对应应用以生效" `
-            "    ⚠️  Fully quit and restart the corresponding apps for changes to take effect"
+        Msg "    请完全退出并重新打开对应应用以生效" `
+            "    Fully quit and restart the corresponding apps for changes to take effect"
     }
     Write-Host ""
 }
@@ -2777,7 +2721,7 @@ function Cmd-Install {
         }
         Write-Config
         Install-Command
-        Inject-QoderworkRuntimeWrapper
+        Retire-QoderworkRuntimeOverrides
 
         Enable-PilotScheduledTasksAfterDeploy
         Msg "==> 启动服务..." "==> Starting service..."
@@ -2847,7 +2791,7 @@ function Cmd-Upgrade {
 
         Deploy-Package $script:INSTALL_SRC
         Install-Command
-        Inject-QoderworkRuntimeWrapper
+        Retire-QoderworkRuntimeOverrides
 
         Enable-PilotScheduledTasksAfterDeploy
         Msg "==> 启动新版本..." "==> Starting new version..."

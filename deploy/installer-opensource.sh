@@ -69,6 +69,7 @@ CMS_ENDPOINT=""
 CMS_WORKSPACE=""
 SERVICE_NAME_PREFIX=""
 SELECTED_AGENTS=""
+AGENT_SELECTION_EXPLICIT=0
 MASK_MODE=""
 MASK_TYPES=""
 HAS_SUDO=0
@@ -134,8 +135,8 @@ while [[ $# -gt 0 ]]; do
         --cms-workspace=*)    CMS_WORKSPACE="${1#*=}"; shift ;;
         --service-name-prefix) SERVICE_NAME_PREFIX="$2"; shift 2 ;;
         --service-name-prefix=*) SERVICE_NAME_PREFIX="${1#*=}"; shift ;;
-        --agents)             SELECTED_AGENTS="$2"; shift 2 ;;
-        --agents=*)           SELECTED_AGENTS="${1#*=}"; shift ;;
+        --agents)             SELECTED_AGENTS="$2"; AGENT_SELECTION_EXPLICIT=1; shift 2 ;;
+        --agents=*)           SELECTED_AGENTS="${1#*=}"; AGENT_SELECTION_EXPLICIT=1; shift ;;
         --mask-mode)          MASK_MODE="$2"; shift 2 ;;
         --mask-mode=*)        MASK_MODE="${1#*=}"; shift ;;
         --mask-types)         MASK_TYPES="$2"; shift 2 ;;
@@ -621,7 +622,7 @@ PROBE_RESULT="[]"
 
 probe_agents() {
     msg "==> 探测 AI Agent..." "==> Probing AI Agents..."
-    PROBE_RESULT=$("$NODE_BIN" "$INSTALL_SRC/dist/cli-probe.cjs" 2>/dev/null) || {
+    PROBE_RESULT=$("$NODE_BIN" "$INSTALL_SRC/dist/cli-probe.cjs" --installer --config-path "$DATA_DIR/config.json" 2>/dev/null) || {
         msg "    ⚠️  Agent 探测失败，将跳过选择" "    ⚠️  Agent probe failed, skipping selection"
         PROBE_RESULT="[]"
         return 0
@@ -669,8 +670,8 @@ const defaults = [];
 for (let i = 0; i < r.length; i++) {
   const a = r[i];
   const status = lang === 'zh'
-    ? (a.detected ? '已检测到: ' + a.reason : '未检测到')
-    : (a.detected ? 'detected: ' + a.reason : 'not detected');
+    ? (a.detected ? '已检测到: ' + a.reason : '未检测到' + (a.reason ? ': ' + a.reason : ''))
+    : (a.detected ? 'detected: ' + a.reason : 'not detected' + (a.reason ? ': ' + a.reason : ''));
   console.log('    [' + (i+1) + '] ' + a.displayName.padEnd(16) + '(' + status + ')');
   if (a.detected) defaults.push(i+1);
 }
@@ -702,6 +703,7 @@ rl.question('    > ', (answer) => {
     }
 
     # Compute final selection: empty input = detected agents, otherwise use exact input
+    if [ -n "$select_input" ]; then AGENT_SELECTION_EXPLICIT=1; fi
     SELECTED_AGENTS=$(printf '%s' "$PROBE_RESULT" | "$NODE_BIN" -e "
 const r = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const input = (process.argv[1] || '').replace(/[，、；]/g, ',');
@@ -1002,6 +1004,7 @@ write_config() {
     printf '%s' "$PROBE_RESULT" | \
         LP_SLS_API_KEY="$SLS_API_KEY" \
         LP_SELECTED_AGENTS="$SELECTED_AGENTS" \
+        LP_AGENT_SELECTION_EXPLICIT="$AGENT_SELECTION_EXPLICIT" \
         LP_DASHBOARD_PORT="$DASHBOARD_PORT" \
         "$NODE_BIN" -e "
 const fs = require('fs');
@@ -1111,11 +1114,25 @@ if (maskMode) {
 
 if (selectedAgents) {
   config.agents = config.agents || {};
+  const previousOpenclaw = config.agents.openclaw;
   const selected = selectedAgents.split(',').map(s => s.trim()).filter(Boolean);
   const allAgents = JSON.parse(fs.readFileSync(0, 'utf8') || '[]');
   for (const agent of allAgents) {
     config.agents[agent.id] = config.agents[agent.id] || {};
+    // A transient discovery miss is not consent to uninstall a live plugin.
+    if (agent.id === 'openclaw' && !agent.detected && process.env.LP_AGENT_SELECTION_EXPLICIT !== '1'
+        && previousOpenclaw !== undefined) {
+      console.log('OpenClaw: detection unavailable; preserving previous enabled state and entry');
+      continue;
+    }
     config.agents[agent.id].enabled = selected.includes(agent.id);
+    if (agent.id === 'openclaw' && agent.detected && selected.includes(agent.id) && agent.openclawCliPath) {
+      const previousEntry = config.agents[agent.id].cliPath;
+      if (typeof previousEntry === 'string' && previousEntry !== agent.openclawCliPath) {
+        console.log('OpenClaw: updating launch entry ' + JSON.stringify(previousEntry) + ' -> ' + JSON.stringify(agent.openclawCliPath));
+      }
+      config.agents[agent.id].cliPath = agent.openclawCliPath;
+    }
   }
 }
 
@@ -1203,6 +1220,16 @@ _sed_inplace() {
     fi
 }
 
+# Is `needle` present INSIDE the begin/end marker region of `file`?
+# Signature checks must be scoped this way rather than grepping the whole rc
+# file: the qodercli and qoderclicn blocks both name the same wrapper script, so
+# a file-wide match lets one block vouch for the other and a stale block never
+# gets migrated. Mirrors extractMarkerBlock() in src/core/hook-watchdog.ts.
+_rc_block_contains() {
+    local file="$1" begin="$2" end="$3" needle="$4"
+    sed -n "/$begin/,/$end/p" "$file" 2>/dev/null | grep -qF "$needle"
+}
+
 inject_qodercli_token_intercept() {
     # Not selected: clean up any stale block from a prior install, then bail.
     if ! echo "$SELECTED_AGENTS" | grep -q 'qoder'; then remove_qodercli_token_intercept; return 0; fi
@@ -1227,7 +1254,10 @@ inject_qodercli_token_intercept() {
         # so the new guarded block below replaces it (the old bare block
         # parse-errors under a user alias, which is exactly what we're fixing).
         if grep -q 'loongsuite-pilot BEGIN qodercli-intercept' "$file" 2>/dev/null; then
-            if grep -qF 'qodercli-runtime-wrapper.sh' "$file"; then return 0; fi
+            if _rc_block_contains "$file" \
+                'loongsuite-pilot BEGIN qodercli-intercept' \
+                'loongsuite-pilot END qodercli-intercept' \
+                'qodercli-runtime-wrapper.sh'; then return 0; fi
             _sed_inplace '/# loongsuite-pilot BEGIN qodercli-intercept/,/# loongsuite-pilot END qodercli-intercept/d' "$file"
         fi
         [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l)" -eq 0 ] && echo "" >> "$file"
@@ -1281,125 +1311,85 @@ remove_qodercli_token_intercept() {
     done
 }
 
-# ============================================================
-# QoderWork-family runtime wrapper: intercept token usage via the SDK-wide
-# QODER_WORKER_RUNTIME_PATH and QwenWorkCN-specific
-# QW_QODER_WORKER_RUNTIME_PATH override.
-#
-# These desktop apps run the agent SDK in a Node.js worker_thread (not Bun), so
-# the qodercli BUN_OPTIONS --preload trick does not apply. The wrapper installs
-# a JSON.parse hook then imports the verified host runtime. On macOS we set the
-# variables via launchctl so GUI-launched apps inherit them. Linux/Windows are
-# skipped (Electron env injection there is tracked separately).
-# ============================================================
-inject_qoderwork_runtime_wrapper() {
-    if [ "$(uname)" != "Darwin" ]; then return 0; fi
-    local wants_qoder_family=false
-    local wants_qwen_work_cn=false
-    if echo "$SELECTED_AGENTS" | grep -q 'qoder-work'; then wants_qoder_family=true; fi
-    if echo "$SELECTED_AGENTS" | grep -q 'qwen-work-cn'; then wants_qwen_work_cn=true; fi
-    if [ "$wants_qoder_family" != "true" ] && [ "$wants_qwen_work_cn" != "true" ]; then
-        remove_qoderwork_runtime_wrapper
-        return 0
-    fi
+# The CN line gets its own function rather than sharing the one above: that
+# block's exact bytes are part of a released idempotency contract (the watchdog
+# greps for them), so it is left untouched. Only the marker and the flavor
+# variable differ here — the wrapper and preload script are the same assets.
+inject_qoderclicn_token_intercept() {
+    # Not selected: clean up any stale block from a prior install, then bail.
+    if ! echo "$SELECTED_AGENTS" | grep -q 'qoder-cn'; then remove_qoderclicn_token_intercept; return 0; fi
+    if ! command -v qoderclicn >/dev/null 2>&1; then return 0; fi
 
-    local wrapper_script="$DATA_DIR/hooks/qoderwork-runtime-wrapper.mjs"
-    if [ ! -f "$wrapper_script" ]; then return 0; fi
+    local intercept_script="$DATA_DIR/hooks/qodercli-token-intercept.mjs"
+    local runtime_wrapper="$DATA_DIR/hooks/qodercli-runtime-wrapper.sh"
+    if [ ! -f "$intercept_script" ] || [ ! -f "$runtime_wrapper" ]; then return 0; fi
 
-    msg "==> 配置 QoderWork 系列 token 采集..." "==> Configuring QoderWork-family token intercept..."
+    msg "==> 配置 qoderclicn token 采集..." "==> Configuring qoderclicn token intercept..."
 
-    local plist_dir="$HOME/Library/LaunchAgents"
-    mkdir -p "$plist_dir"
-
-    if [ "$wants_qoder_family" = "true" ] && {
-        [ -d "/Applications/QoderWork.app" ] || [ -d "$HOME/Applications/QoderWork.app" ] ||
-        [ -d "/Applications/QoderWork CN.app" ] || [ -d "$HOME/Applications/QoderWork CN.app" ] ||
-        [ -d "/Applications/QoderWorkCN.app" ] || [ -d "$HOME/Applications/QoderWorkCN.app" ];
-    }; then
-        local qoder_plist_path="$plist_dir/com.loongsuite-pilot.qoderwork-env.plist"
-        launchctl setenv QODER_WORKER_RUNTIME_PATH "$wrapper_script"
-        cat > "$qoder_plist_path" << PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.loongsuite-pilot.qoderwork-env</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/launchctl</string>
-        <string>setenv</string>
-        <string>QODER_WORKER_RUNTIME_PATH</string>
-        <string>$wrapper_script</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-PLIST
-        launchctl unload "$qoder_plist_path" 2>/dev/null || true
-        launchctl load "$qoder_plist_path" 2>/dev/null || true
-        msg "    ✅ QODER_WORKER_RUNTIME_PATH (QoderWork/QoderWorkCN)" \
-            "    ✅ QODER_WORKER_RUNTIME_PATH (QoderWork/QoderWorkCN)"
-    else
-        local stale_qoder_plist="$plist_dir/com.loongsuite-pilot.qoderwork-env.plist"
-        launchctl unload "$stale_qoder_plist" 2>/dev/null || true
-        rm -f "$stale_qoder_plist"
-        if launchctl getenv QODER_WORKER_RUNTIME_PATH 2>/dev/null | grep -q 'loongsuite-pilot'; then
-            launchctl unsetenv QODER_WORKER_RUNTIME_PATH
+    _inject_cn_to_rc() {
+        local file="$1"
+        if [ ! -f "$file" ]; then return 0; fi
+        if [ ! -w "$file" ]; then
+            msg "    ⚠️  $file 不可写，跳过" "    ⚠️  $file is not writable, skipping"
+            return 0
         fi
-    fi
-
-    # QwenWorkCN checks this product-specific override before falling back to
-    # the SDK-wide QODER_WORKER_RUNTIME_PATH. Setting it prevents another
-    # Qoder-family application from deciding QwenWorkCN's worker entry.
-    if [ "$wants_qwen_work_cn" = "true" ] && {
-        [ -d "/Applications/QwenWorkCN.app" ] || [ -d "$HOME/Applications/QwenWorkCN.app" ];
-    }; then
-        local qwen_plist_path="$plist_dir/com.loongsuite-pilot.qwenworkcn-env.plist"
-        launchctl setenv QW_QODER_WORKER_RUNTIME_PATH "$wrapper_script"
-        cat > "$qwen_plist_path" << PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.loongsuite-pilot.qwenworkcn-env</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/launchctl</string>
-        <string>setenv</string>
-        <string>QW_QODER_WORKER_RUNTIME_PATH</string>
-        <string>$wrapper_script</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-PLIST
-        launchctl unload "$qwen_plist_path" 2>/dev/null || true
-        launchctl load "$qwen_plist_path" 2>/dev/null || true
-        msg "    ✅ QW_QODER_WORKER_RUNTIME_PATH (QwenWorkCN 优先)" \
-            "    ✅ QW_QODER_WORKER_RUNTIME_PATH (QwenWorkCN priority)"
-    else
-        local stale_qwen_plist="$plist_dir/com.loongsuite-pilot.qwenworkcn-env.plist"
-        launchctl unload "$stale_qwen_plist" 2>/dev/null || true
-        rm -f "$stale_qwen_plist"
-        if launchctl getenv QW_QODER_WORKER_RUNTIME_PATH 2>/dev/null | grep -q 'loongsuite-pilot'; then
-            launchctl unsetenv QW_QODER_WORKER_RUNTIME_PATH
+        # Migrate-or-skip, same shape as the qodercli block: the signature is the
+        # flavor assignment, since the wrapper name cannot tell the two apart.
+        if grep -q 'loongsuite-pilot BEGIN qoderclicn-intercept' "$file" 2>/dev/null; then
+            if _rc_block_contains "$file" \
+                'loongsuite-pilot BEGIN qoderclicn-intercept' \
+                'loongsuite-pilot END qoderclicn-intercept' \
+                'LOONGSUITE_QODERCLI_FLAVOR=qoderclicn'; then return 0; fi
+            _sed_inplace '/# loongsuite-pilot BEGIN qoderclicn-intercept/,/# loongsuite-pilot END qoderclicn-intercept/d' "$file"
         fi
-    fi
+        [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l)" -eq 0 ] && echo "" >> "$file"
+        # Double-quoted heredoc so $DATA_DIR expands at install time. $@ is
+        # escaped to defer expansion to runtime. Keep byte-identical to the
+        # watchdog's blockFn (src/core/hook-watchdog.ts, id qoderclicn-rc).
+        cat >> "$file" << INTERCEPTBLOCK
 
-    msg "    ⚠️  请完全退出并重新打开对应应用以生效" \
-        "    ⚠️  Fully quit and restart the corresponding app for changes to take effect"
+# loongsuite-pilot BEGIN qoderclicn-intercept
+if ! alias qoderclicn >/dev/null 2>&1 && ! typeset -f qoderclicn >/dev/null 2>&1; then
+  eval 'qoderclicn() { LOONGSUITE_QODERCLI_FLAVOR=qoderclicn "$DATA_DIR/hooks/qodercli-runtime-wrapper.sh" "\$@"; }'
+fi
+# loongsuite-pilot END qoderclicn-intercept
+INTERCEPTBLOCK
+        msg "    ✅ 已写入 $file (请执行 source $file 或打开新终端)" \
+            "    ✅ Written to $file (run: source $file or open a new terminal)"
+    }
+
+    case "${SHELL:-/bin/bash}" in
+        */zsh)  _inject_cn_to_rc "$HOME/.zshrc" ;;
+        */bash) _inject_cn_to_rc "$HOME/.bashrc" ;;
+        *)      _inject_cn_to_rc "$HOME/.bashrc" ;;
+    esac
+
+    if _rc_user_override_present qoderclicn \
+        'loongsuite-pilot BEGIN qoderclicn-intercept' \
+        'loongsuite-pilot END qoderclicn-intercept'; then
+        msg "    ⚠️  检测到你已自定义 qoderclicn(alias/function)，为避免覆盖，采集未启用。" \
+            "    ⚠️  Detected your own 'qoderclicn' (alias/function); collection is disabled to avoid clobbering it."
+        msg "        如需启用采集，请让你的定义调用： LOONGSUITE_QODERCLI_FLAVOR=qoderclicn $runtime_wrapper" \
+            "        To enable collection, have your definition call: LOONGSUITE_QODERCLI_FLAVOR=qoderclicn $runtime_wrapper"
+    fi
     echo ""
 }
 
-remove_qoderwork_runtime_wrapper() {
+remove_qoderclicn_token_intercept() {
+    for file in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+        if [ -f "$file" ] && grep -q 'loongsuite-pilot BEGIN qoderclicn-intercept' "$file" 2>/dev/null; then
+            _sed_inplace '/# loongsuite-pilot BEGIN qoderclicn-intercept/,/# loongsuite-pilot END qoderclicn-intercept/d' "$file"
+            msg "    已清理 qoderclicn token intercept ($file)" \
+                "    Cleaned up qoderclicn token intercept ($file)"
+        fi
+    done
+}
+
+
+# Restore app defaults without requiring the old wrapper, app, or agent selection to exist.
+retire_qoderwork_runtime_overrides() {
     if [ "$(uname)" != "Darwin" ]; then return 0; fi
 
-    # Unload + remove the LaunchAgent plist so the env stops auto-restoring on
-    # next login.
     local plist_path
     for plist_path in \
         "$HOME/Library/LaunchAgents/com.loongsuite-pilot.qoderwork-env.plist" \
@@ -1410,18 +1400,14 @@ remove_qoderwork_runtime_wrapper() {
         fi
     done
 
-    # Drop the env from the current session too (conservative grep avoids
-    # touching env values the user set manually to a non-loongsuite path).
-    if launchctl getenv QODER_WORKER_RUNTIME_PATH 2>/dev/null | grep -q 'loongsuite-pilot'; then
-        launchctl unsetenv QODER_WORKER_RUNTIME_PATH
-        msg "    已清理 QODER_WORKER_RUNTIME_PATH" \
-            "    Cleaned up QODER_WORKER_RUNTIME_PATH"
-    fi
-    if launchctl getenv QW_QODER_WORKER_RUNTIME_PATH 2>/dev/null | grep -q 'loongsuite-pilot'; then
-        launchctl unsetenv QW_QODER_WORKER_RUNTIME_PATH
-        msg "    已清理 QW_QODER_WORKER_RUNTIME_PATH" \
-            "    Cleaned up QW_QODER_WORKER_RUNTIME_PATH"
-    fi
+    local env_name current_runtime
+    for env_name in QW_QODER_WORKER_RUNTIME_PATH QODER_WORKER_RUNTIME_PATH; do
+        current_runtime=$(launchctl getenv "$env_name" 2>/dev/null || true)
+        if [ "$current_runtime" = "$DATA_DIR/hooks/qoderwork-runtime-wrapper.mjs" ] || printf '%s' "$current_runtime" | grep -q 'loongsuite-pilot'; then
+            launchctl unsetenv "$env_name"
+            msg "    已清理 $env_name" "    Cleaned up $env_name"
+        fi
+    done
 }
 
 # ============================================================
@@ -1976,8 +1962,9 @@ cmd_install() {
     fi
     write_config
     install_loongsuite_pilot_command
+    retire_qoderwork_runtime_overrides
     inject_qodercli_token_intercept
-    inject_qoderwork_runtime_wrapper
+    inject_qoderclicn_token_intercept
     inject_claude_code_fetch_intercept
 
     msg "==> 启动服务..." "==> Starting service..."
@@ -2073,6 +2060,7 @@ cmd_upgrade() {
         exit 1
     fi
     install_loongsuite_pilot_command
+    retire_qoderwork_runtime_overrides
 
     # Start the new version
     msg "==> 启动新版本..." "==> Starting new version..."
@@ -2879,7 +2867,8 @@ cmd_uninstall() {
     remove_hook_configs
     remove_grok_build_hook_config
     remove_qodercli_token_intercept
-    remove_qoderwork_runtime_wrapper
+    remove_qoderclicn_token_intercept
+    retire_qoderwork_runtime_overrides
     remove_claude_code_fetch_intercept
     echo ""
 

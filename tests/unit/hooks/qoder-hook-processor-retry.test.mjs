@@ -10,6 +10,7 @@ import {
   buildEventsFromBoundaries,
   findIncrementalTurnEndLine,
   findTriggeredTurnWindow,
+  hasQoderCnTerminalMarker,
   isRetryLockStale,
   readRetryLock,
   releaseRetryLock,
@@ -169,10 +170,14 @@ describe('selectTurnSegmentsForCollection', () => {
 });
 
 describe('buildLlmBoundaries complete-response priority', () => {
-  const assistant = (timestamp, content) => ({
+  const assistant = (timestamp, content, stopReason) => ({
     type: 'assistant',
     timestamp,
-    message: { role: 'assistant', content },
+    message: {
+      role: 'assistant',
+      content,
+      ...(stopReason ? { stop_reason: stopReason } : {}),
+    },
   });
   const toolResult = (timestamp, id) => ({
     type: 'user',
@@ -232,7 +237,7 @@ describe('buildLlmBoundaries complete-response priority', () => {
     expect(buildLlmBoundaries(progress, rows)).toHaveLength(2);
   });
 
-  it('preserves microsecond ordering between tool completion and the next assistant response', () => {
+  it('derives the next request from the completed tool result, not progress timing', () => {
     const rows = [
       {
         type: 'user',
@@ -258,8 +263,8 @@ describe('buildLlmBoundaries complete-response priority', () => {
 
     const boundaries = buildLlmBoundaries(progress, rows);
     expect(boundaries.map(boundary => boundary.startTs)).toEqual([
-      '2026-08-03T09:22:25.000000Z',
-      '2026-08-03T09:22:26.999176Z',
+      '2026-08-03T09:22:25.555446Z',
+      '2026-08-03T09:22:26.999890Z',
     ]);
 
     const records = buildEventsFromBoundaries(
@@ -274,9 +279,16 @@ describe('buildLlmBoundaries complete-response priority', () => {
         ['llm.request', 'turn-microseconds:s2'],
         ['llm.response', 'turn-microseconds:s2'],
       ]);
+    expect(records
+      .filter(record => record['event.name'] === 'llm.request')
+      .map(record => record.time_unix_nano))
+      .toEqual([
+        String(BigInt(Date.parse('2026-08-03T09:22:25.100Z')) * 1_000_000n + 1n),
+        String(BigInt(Date.parse('2026-08-03T09:22:26.668Z')) * 1_000_000n + 419_001n),
+      ]);
   });
 
-  it('starts a complete next step after PostToolUseFailure', () => {
+  it('starts a complete next step from a failed tool_result, independent of PostToolUseFailure', () => {
     const rows = [
       {
         type: 'user',
@@ -313,8 +325,8 @@ describe('buildLlmBoundaries complete-response priority', () => {
 
     const boundaries = buildLlmBoundaries(progress, rows);
     expect(boundaries.map(boundary => boundary.startTs)).toEqual([
-      '2026-07-30T00:59:59.000Z',
-      '2026-07-30T01:00:01.500Z',
+      '2026-07-30T01:00:00.000Z',
+      '2026-07-30T01:00:02.000Z',
     ]);
 
     const records = buildEventsFromBoundaries(
@@ -331,7 +343,7 @@ describe('buildLlmBoundaries complete-response priority', () => {
       ]);
   });
 
-  it('uses PostToolUseFailure to close a tool cycle whose result is missing', () => {
+  it('preserves a terminal response when tool_result is missing', () => {
     const rows = [
       {
         type: 'user',
@@ -340,10 +352,13 @@ describe('buildLlmBoundaries complete-response priority', () => {
       },
       assistant('2026-07-30T01:00:00.000Z', [
         { type: 'tool_use', id: 'tool-a', name: 'Read', input: { path: 'missing' } },
+      ], 'tool_use'),
+      assistant('2026-07-30T01:00:01.900Z', [
+        { type: 'thinking', thinking: 'the tool was cancelled' },
       ]),
       assistant('2026-07-30T01:00:02.000Z', [
         { type: 'text', text: 'the tool was cancelled' },
-      ]),
+      ], 'end_turn'),
     ];
     const progress = [
       { hookEvent: 'UserPromptSubmit', ts: '2026-07-30T00:59:59.000Z' },
@@ -366,6 +381,184 @@ describe('buildLlmBoundaries complete-response priority', () => {
         ['llm.request', 'turn-missing-result:s2'],
         ['llm.response', 'turn-missing-result:s2'],
       ]);
+    expect(records.filter(record => record['event.name'] === 'tool.call')).toHaveLength(1);
+    expect(records.filter(record => record['event.name'] === 'tool.result')).toHaveLength(0);
+    const responses = records.filter(record => record['event.name'] === 'llm.response');
+    expect(responses.map(record => ({
+      parts: record['gen_ai.output.messages'][0].parts.map(part => part.type),
+      finishReasons: record['gen_ai.response.finish_reasons'],
+      turnEnd: record['gen_ai.turn.end'],
+    }))).toEqual([
+      { parts: ['tool_call'], finishReasons: ['tool_call'], turnEnd: undefined },
+      { parts: ['reasoning', 'text'], finishReasons: ['end_turn'], turnEnd: true },
+    ]);
+  });
+
+  it('conservatively merges later assistant rows when both tool_result and stop_reason are missing', () => {
+    const rows = [
+      assistant('2026-07-30T01:00:00.000Z', [
+        { type: 'tool_use', id: 'tool-a', name: 'Read', input: { path: 'missing' } },
+      ]),
+      assistant('2026-07-30T01:00:02.000Z', [
+        { type: 'text', text: 'the tool state is unknown' },
+      ]),
+    ];
+
+    expect(buildLlmBoundaries([], rows)).toHaveLength(1);
+  });
+
+  it('keeps structure and content identical when third-party PostToolUse progress is present', () => {
+    const rows = [
+      {
+        type: 'user',
+        timestamp: '2026-09-05T02:35:58.605Z',
+        message: { role: 'user', content: 'fix it' },
+      },
+      assistant('2026-09-05T02:36:31.960Z', [
+        { type: 'thinking', thinking: 'read' },
+        { type: 'tool_use', id: 'read-a', name: 'Read', input: {} },
+      ]),
+      toolResult('2026-09-05T02:36:32.017Z', 'read-a'),
+      assistant('2026-09-05T02:36:44.873Z', [
+        { type: 'text', text: 'write' },
+        { type: 'tool_use', id: 'write-a', name: 'Write', input: {} },
+      ]),
+      toolResult('2026-09-05T02:36:47.452Z', 'write-a'),
+      assistant('2026-09-05T02:37:03.225Z', [{ type: 'text', text: 'done' }]),
+    ];
+    const qoderSecProgress = [
+      { hookEvent: 'PostToolUse', hookName: 'PostToolUse:Write', ts: '2026-09-05T02:36:47.814Z' },
+      { hookEvent: 'PostToolUse', hookName: 'PostToolUse:Write', ts: '2026-09-05T02:36:47.814Z' },
+      { hookEvent: 'Stop', hookName: 'Stop', ts: '2026-09-05T02:37:05.726Z' },
+    ];
+
+    const withThirdParty = buildLlmBoundaries(qoderSecProgress, rows);
+    const withoutThirdParty = buildLlmBoundaries(
+      qoderSecProgress.filter(event => event.hookEvent !== 'PostToolUse'),
+      rows,
+    );
+    expect(withThirdParty).toEqual(withoutThirdParty);
+    expect(withThirdParty.map(boundary => [boundary.contentStartIndex, boundary.contentEndIndex]))
+      .toEqual([[1, 3], [3, 5], [5, 6]]);
+
+    const summarize = boundaries => buildEventsFromBoundaries(
+      boundaries, rows, rows, 'turn-qodersec', 'session-1', 'qoder', {}, undefined,
+    ).map(record => ({
+      name: record['event.name'],
+      step: record['gen_ai.step.id'],
+      toolId: record['gen_ai.tool.call.id'],
+      parts: record['gen_ai.output.messages']?.[0]?.parts?.map(part => part.type),
+      time: record.time_unix_nano,
+    }));
+    expect(summarize(withThirdParty)).toEqual(summarize(withoutThirdParty));
+  });
+
+  it('keeps responses populated when adjacent groups have the same assistant timestamp', () => {
+    const rows = [
+      {
+        type: 'user',
+        timestamp: '2026-09-05T02:35:58.000Z',
+        message: { role: 'user', content: 'go' },
+      },
+      assistant('2026-09-05T02:36:00.000Z', [
+        { type: 'tool_use', id: 'tool-a', name: 'Read', input: {} },
+      ]),
+      toolResult('2026-09-05T02:36:00.100Z', 'tool-a'),
+      assistant('2026-09-05T02:36:00.000Z', [{ type: 'text', text: 'done' }]),
+    ];
+    const boundaries = buildLlmBoundaries([], rows);
+    const records = buildEventsFromBoundaries(
+      boundaries, rows, rows, 'turn-same-ts', 'session-1', 'qoder', {}, undefined,
+    );
+
+    expect(boundaries.map(boundary => [boundary.contentStartIndex, boundary.contentEndIndex]))
+      .toEqual([[1, 3], [3, 4]]);
+    const responses = records.filter(record => record['event.name'] === 'llm.response');
+    const secondRequest = records.find(record =>
+      record['event.name'] === 'llm.request' &&
+      record['gen_ai.step.id'] === 'turn-same-ts:s2');
+    const firstToolResult = records.find(record => record['event.name'] === 'tool.result');
+
+    expect(responses).toHaveLength(2);
+    expect(BigInt(responses[0].time_unix_nano))
+      .toBeLessThan(BigInt(secondRequest.time_unix_nano));
+    expect(BigInt(firstToolResult.time_unix_nano))
+      .toBeLessThan(BigInt(secondRequest.time_unix_nano));
+    expect(BigInt(secondRequest.time_unix_nano))
+      .toBeLessThan(BigInt(responses[1].time_unix_nano));
+  });
+
+  it('preserves sub-millisecond transcript order in emitted timestamps', () => {
+    const rows = [
+      {
+        type: 'user',
+        timestamp: '2026-09-05T02:35:59.999900Z',
+        message: { role: 'user', content: 'go' },
+      },
+      assistant('2026-09-05T02:36:00.000100Z', [
+        { type: 'tool_use', id: 'tool-a', name: 'Read', input: {} },
+      ]),
+      toolResult('2026-09-05T02:36:00.000300Z', 'tool-a'),
+      assistant('2026-09-05T02:36:00.000900Z', [{ type: 'text', text: 'done' }]),
+    ];
+    const records = buildEventsFromBoundaries(
+      buildLlmBoundaries([], rows),
+      rows,
+      rows,
+      'turn-microsecond-order',
+      'session-1',
+      'qoder',
+      {},
+      undefined,
+    );
+    const firstResponse = records.find(record =>
+      record['event.name'] === 'llm.response' &&
+      record['gen_ai.step.id'] === 'turn-microsecond-order:s1');
+    const toolResultRecord = records.find(record => record['event.name'] === 'tool.result');
+    const secondRequest = records.find(record =>
+      record['event.name'] === 'llm.request' &&
+      record['gen_ai.step.id'] === 'turn-microsecond-order:s2');
+    const secondResponse = records.find(record =>
+      record['event.name'] === 'llm.response' &&
+      record['gen_ai.step.id'] === 'turn-microsecond-order:s2');
+
+    const second = BigInt(Date.parse('2026-09-05T02:36:00Z')) * 1_000_000n;
+    expect(firstResponse.time_unix_nano).toBe(String(second + 100_000n));
+    expect(toolResultRecord.time_unix_nano).toBe(String(second + 300_000n));
+    expect(secondRequest.time_unix_nano).toBe(String(second + 300_001n));
+    expect(secondResponse.time_unix_nano).toBe(String(second + 900_000n));
+  });
+
+  it('uses the final assistant timestamp when SQLite enrichment is unavailable', () => {
+    const rows = [
+      {
+        type: 'user',
+        timestamp: '2026-09-05T02:35:58.000Z',
+        message: { role: 'user', content: 'explain it' },
+      },
+      assistant('2026-09-05T02:36:00.000Z', [
+        { type: 'thinking', thinking: 'reasoning' },
+      ]),
+      assistant('2026-09-05T02:36:02.345Z', [
+        { type: 'text', text: 'answer' },
+      ]),
+    ];
+
+    const records = buildEventsFromBoundaries(
+      buildLlmBoundaries([], rows),
+      rows,
+      rows,
+      'turn-no-sqlite',
+      'session-1',
+      'qoder',
+      {},
+      undefined,
+    );
+    const response = records.find(record => record['event.name'] === 'llm.response');
+
+    expect(response.time_unix_nano).toBe(
+      String(BigInt(Date.parse('2026-09-05T02:36:02.345Z')) * 1_000_000n),
+    );
   });
 
   it('does not close a parallel response until completion signals cover its declared tools', () => {
@@ -667,6 +860,26 @@ describe('findTriggeredTurnWindow stop source variants (B3 P0)', () => {
   });
 });
 
+describe('hasQoderCnTerminalMarker', () => {
+  it('accepts the traditional progress Stop marker', () => {
+    expect(hasQoderCnTerminalMarker([{ hookEvent: 'Stop' }], [])).toBe(true);
+  });
+
+  it('accepts SDK print-mode terminal rows before progress Stop is appended', () => {
+    expect(hasQoderCnTerminalMarker([], [
+      { type: 'assistant', message: { stop_reason: 'end_turn' } },
+      { type: 'last-prompt', lastPrompt: 'summarize the file' },
+    ])).toBe(true);
+  });
+
+  it('rejects a mid-tool snapshot', () => {
+    expect(hasQoderCnTerminalMarker([], [
+      { type: 'assistant', message: { stop_reason: 'tool_use' } },
+      { type: 'user', message: { content: [{ type: 'tool_result' }] } },
+    ])).toBe(false);
+  });
+});
+
 describe('buildEventsFromBoundaries tool result matching', () => {
   it('matches parallel tool results by tool_use_id instead of return order', () => {
     const makeToolResult = (timestamp, id, content, isError = false) => ({
@@ -709,6 +922,8 @@ describe('buildEventsFromBoundaries tool result matching', () => {
     const boundaries = [{
       startTs: '2026-07-30T01:00:00.000Z',
       endTs: '2026-07-30T01:00:03.000Z',
+      contentStartIndex: 1,
+      contentEndIndex: content.length,
     }];
 
     const records = buildEventsFromBoundaries(
